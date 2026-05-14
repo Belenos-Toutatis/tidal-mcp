@@ -215,3 +215,62 @@ class RadioTracks(BaseModel):
     seed_name: str = Field(description="Name of the seed track or artist")
     count: int = Field(description="Number of tracks returned")
     tracks: List[Track] = Field(description="List of recommended tracks")
+
+
+# =============================================================================
+# Editorial / Discovery Models
+# =============================================================================
+
+class GenreInfo(BaseModel):
+    """A TIDAL genre category."""
+
+    name: str = Field(description="Genre display name")
+    path: str = Field(description="Genre path identifier (use this in genre tools)")
+    has_tracks: bool = Field(description="Genre has tracks available")
+    has_albums: bool = Field(description="Genre has albums available")
+    has_playlists: bool = Field(description="Genre has playlists available")
+    has_artists: bool = Field(description="Genre has artists available")
+
+
+class GenreList(BaseModel):
+    """List of available genres."""
+
+    status: str = Field(description="Operation status (success/error)")
+    count: int = Field(description="Number of genres returned")
+    genres: List[GenreInfo] = Field(description="List of genre objects")
+
+
+class MixInfo(BaseModel):
+    """A TIDAL personalized mix."""
+
+    id: str = Field(description="Unique mix ID")
+    title: str = Field(description="Mix title (e.g. 'My Daily Discovery')")
+    sub_title: str = Field(description="Mix subtitle or description")
+
+
+class MixList(BaseModel):
+    """List of personalized mixes."""
+
+    status: str = Field(description="Operation status (success/error)")
+    count: int = Field(description="Number of mixes returned")
+    mixes: List[MixInfo] = Field(description="List of mix objects")
+
+
+class MixTracks(BaseModel):
+    """Tracks from a specific TIDAL mix."""
+
+    status: str = Field(description="Operation status (success/error)")
+    mix_id: str = Field(description="ID of the mix")
+    mix_title: str = Field(description="Title of the mix")
+    count: int = Field(description="Number of tracks returned")
+    tracks: List[Track] = Field(description="List of tracks in the mix")
+
+
+class TrackLyrics(BaseModel):
+    """Lyrics for a TIDAL track."""
+
+    status: str = Field(description="Operation status (success/error)")
+    track_id: str = Field(description="ID of the track")
+    text: str = Field(description="Plain text lyrics")
+    subtitles: Optional[str] = Field(None, description="Timestamped lyrics in LRC format")
+    right_to_left: bool = Field(description="True if lyrics language reads right-to-left")

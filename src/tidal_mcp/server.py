@@ -42,6 +42,14 @@ from .models import (
     DeletePlaylistResult,
     AddToFavoritesResult,
     RemoveFromFavoritesResult,
+    # Editorial / Discovery
+    GenreInfo,
+    GenreList,
+    MixInfo,
+    MixList,
+    MixTracks,
+    # Lyrics
+    TrackLyrics,
 )
 
 
@@ -1145,6 +1153,102 @@ async def get_similar_artists(artist_id: str, limit: int = 10) -> ArtistList:
 # =============================================================================
 
 @mcp.tool()
+async def add_album_to_favorites(album_id: str) -> AddToFavoritesResult:
+    """
+    Add an album to user's favorites (save an album).
+
+    Args:
+        album_id: ID of the album to add to favorites
+
+    Returns:
+        Success status and confirmation
+    """
+    if not await ensure_authenticated():
+        raise ToolError("Not authenticated. Please run the 'login' tool first.")
+
+    try:
+        album_id_int = int(album_id)
+        await anyio.to_thread.run_sync(
+            session.user.favorites.add_album, album_id_int
+        )
+
+        return AddToFavoritesResult(
+            status="success",
+            item_id=album_id,
+            item_type="album",
+            message=f"Album {album_id} added to favorites",
+        )
+    except ValueError:
+        raise ToolError(f"Invalid album ID format: {album_id}")
+    except Exception as e:
+        raise ToolError(f"Failed to add album to favorites: {str(e)}")
+
+
+@mcp.tool()
+async def add_artist_to_favorites(artist_id: str) -> AddToFavoritesResult:
+    """
+    Follow an artist (add to favorite artists).
+
+    Args:
+        artist_id: ID of the artist to follow
+
+    Returns:
+        Success status and confirmation
+    """
+    if not await ensure_authenticated():
+        raise ToolError("Not authenticated. Please run the 'login' tool first.")
+
+    try:
+        artist_id_int = int(artist_id)
+        await anyio.to_thread.run_sync(
+            session.user.favorites.add_artist, artist_id_int
+        )
+
+        return AddToFavoritesResult(
+            status="success",
+            item_id=artist_id,
+            item_type="artist",
+            message=f"Artist {artist_id} added to favorites",
+        )
+    except ValueError:
+        raise ToolError(f"Invalid artist ID format: {artist_id}")
+    except Exception as e:
+        raise ToolError(f"Failed to add artist to favorites: {str(e)}")
+
+
+@mcp.tool()
+async def remove_artist_from_favorites(artist_id: str) -> RemoveFromFavoritesResult:
+    """
+    Unfollow an artist (remove from favorite artists).
+
+    Args:
+        artist_id: ID of the artist to unfollow
+
+    Returns:
+        Success status and confirmation
+    """
+    if not await ensure_authenticated():
+        raise ToolError("Not authenticated. Please run the 'login' tool first.")
+
+    try:
+        artist_id_int = int(artist_id)
+        await anyio.to_thread.run_sync(
+            session.user.favorites.remove_artist, artist_id_int
+        )
+
+        return RemoveFromFavoritesResult(
+            status="success",
+            item_id=artist_id,
+            item_type="artist",
+            message=f"Artist {artist_id} removed from favorites",
+        )
+    except ValueError:
+        raise ToolError(f"Invalid artist ID format: {artist_id}")
+    except Exception as e:
+        raise ToolError(f"Failed to remove artist from favorites: {str(e)}")
+
+
+@mcp.tool()
 async def get_favorite_albums(limit: int = 50) -> AlbumList:
     """
     Get user's favorite (saved) albums from TIDAL.
@@ -1381,6 +1485,519 @@ async def get_similar_albums(album_id: str, limit: int = 10) -> AlbumList:
         raise
     except Exception as e:
         raise ToolError(f"Failed to get similar albums: {str(e)}")
+
+
+# =============================================================================
+# Editorial / Discovery Tools
+# =============================================================================
+
+async def _get_genre_by_path(path_or_name: str):
+    """Find a Genre object by path or name (case-insensitive)."""
+    genres = await anyio.to_thread.run_sync(session.genre.get_genres)
+    for g in genres:
+        if g.path.lower() == path_or_name.lower():
+            return g
+    for g in genres:
+        if g.name.lower() == path_or_name.lower():
+            return g
+    available = ", ".join(f"{g.name} ({g.path})" for g in genres)
+    raise ToolError(f"Genre '{path_or_name}' not found. Available genres: {available}")
+
+
+@mcp.tool()
+async def get_genres() -> GenreList:
+    """
+    List all music genres available on TIDAL.
+
+    Returns:
+        List of genres with name, path identifier, and available content types.
+        Use the 'path' field in get_genre_tracks/albums/playlists tools.
+    """
+    if not await ensure_authenticated():
+        raise ToolError("Not authenticated. Please run the 'login' tool first.")
+
+    try:
+        genres = await anyio.to_thread.run_sync(session.genre.get_genres)
+
+        genre_list = [
+            GenreInfo(
+                name=g.name,
+                path=g.path,
+                has_tracks=bool(g.tracks),
+                has_albums=bool(g.albums),
+                has_playlists=bool(g.playlists),
+                has_artists=bool(g.artists),
+            )
+            for g in genres
+        ]
+
+        return GenreList(status="success", count=len(genre_list), genres=genre_list)
+    except Exception as e:
+        raise ToolError(f"Failed to get genres: {str(e)}")
+
+
+@mcp.tool()
+async def get_genre_tracks(genre_path: str, limit: int = 20) -> TrackList:
+    """
+    Get tracks from a specific TIDAL genre.
+
+    Args:
+        genre_path: Genre path from get_genres (e.g. 'rock', 'pop', 'jazz')
+        limit: Maximum tracks to return (default: 20)
+
+    Returns:
+        List of tracks in the genre
+    """
+    if not await ensure_authenticated():
+        raise ToolError("Not authenticated. Please run the 'login' tool first.")
+
+    try:
+        genre = await _get_genre_by_path(genre_path)
+        if not genre.tracks:
+            raise ToolError(f"Genre '{genre.name}' has no tracks available")
+
+        raw = await anyio.to_thread.run_sync(
+            lambda: genre.items(tidalapi.Track)
+        )
+        limited = raw[:limit] if raw else []
+
+        tracks = [
+            Track(
+                id=str(t.id),
+                title=t.name,
+                artist=t.artist.name if t.artist else "Unknown Artist",
+                album=t.album.name if t.album else "Unknown Album",
+                duration_seconds=t.duration,
+                url=f"https://tidal.com/browse/track/{t.id}",
+            )
+            for t in limited
+        ]
+
+        return TrackList(status="success", count=len(tracks), tracks=tracks)
+    except ToolError:
+        raise
+    except Exception as e:
+        raise ToolError(f"Failed to get genre tracks: {str(e)}")
+
+
+@mcp.tool()
+async def get_genre_albums(genre_path: str, limit: int = 20) -> AlbumList:
+    """
+    Get albums from a specific TIDAL genre.
+
+    Args:
+        genre_path: Genre path from get_genres (e.g. 'rock', 'pop', 'jazz')
+        limit: Maximum albums to return (default: 20)
+
+    Returns:
+        List of albums in the genre
+    """
+    if not await ensure_authenticated():
+        raise ToolError("Not authenticated. Please run the 'login' tool first.")
+
+    try:
+        genre = await _get_genre_by_path(genre_path)
+        if not genre.albums:
+            raise ToolError(f"Genre '{genre.name}' has no albums available")
+
+        raw = await anyio.to_thread.run_sync(
+            lambda: genre.items(tidalapi.Album)
+        )
+        limited = raw[:limit] if raw else []
+
+        albums = []
+        for a in limited:
+            release_date = None
+            if hasattr(a, "release_date") and a.release_date:
+                release_date = str(a.release_date)
+            albums.append(
+                Album(
+                    id=str(a.id),
+                    title=a.name,
+                    artist=a.artist.name if a.artist else "Unknown Artist",
+                    release_date=release_date,
+                    num_tracks=getattr(a, "num_tracks", 0),
+                    duration_seconds=getattr(a, "duration", 0),
+                    url=f"https://tidal.com/browse/album/{a.id}",
+                )
+            )
+
+        return AlbumList(status="success", count=len(albums), albums=albums)
+    except ToolError:
+        raise
+    except Exception as e:
+        raise ToolError(f"Failed to get genre albums: {str(e)}")
+
+
+@mcp.tool()
+async def get_genre_playlists(genre_path: str, limit: int = 20) -> PlaylistList:
+    """
+    Get editorial playlists from a specific TIDAL genre.
+
+    Args:
+        genre_path: Genre path from get_genres (e.g. 'rock', 'pop', 'jazz')
+        limit: Maximum playlists to return (default: 20)
+
+    Returns:
+        List of curated playlists for the genre
+    """
+    if not await ensure_authenticated():
+        raise ToolError("Not authenticated. Please run the 'login' tool first.")
+
+    try:
+        genre = await _get_genre_by_path(genre_path)
+        if not genre.playlists:
+            raise ToolError(f"Genre '{genre.name}' has no playlists available")
+
+        raw = await anyio.to_thread.run_sync(
+            lambda: genre.items(tidalapi.Playlist)
+        )
+        limited = raw[:limit] if raw else []
+
+        playlists = []
+        for p in limited:
+            creator_name = None
+            if hasattr(p, "creator") and p.creator:
+                creator_name = getattr(p.creator, "name", None)
+            playlists.append(
+                Playlist(
+                    id=str(p.id),
+                    name=p.name,
+                    description=getattr(p, "description", "") or "",
+                    track_count=getattr(p, "num_tracks", 0),
+                    creator=creator_name,
+                    url=f"https://tidal.com/browse/playlist/{p.id}",
+                )
+            )
+
+        return PlaylistList(status="success", count=len(playlists), playlists=playlists)
+    except ToolError:
+        raise
+    except Exception as e:
+        raise ToolError(f"Failed to get genre playlists: {str(e)}")
+
+
+@mcp.tool()
+async def get_mixes() -> MixList:
+    """
+    Get user's personalized mixes from TIDAL.
+
+    These are algorithmically curated mixes like 'My Daily Discovery',
+    'My New Arrivals', and genre-specific mixes tailored to the user.
+
+    Returns:
+        List of personalized mixes with id, title, and description.
+        Use mix id with get_mix_tracks to get the tracks.
+    """
+    if not await ensure_authenticated():
+        raise ToolError("Not authenticated. Please run the 'login' tool first.")
+
+    try:
+        mixes_page = await anyio.to_thread.run_sync(session.mixes)
+
+        mixes = []
+        for item in mixes_page:
+            if hasattr(item, "id") and hasattr(item, "title"):
+                mixes.append(
+                    MixInfo(
+                        id=item.id,
+                        title=item.title,
+                        sub_title=getattr(item, "sub_title", "") or "",
+                    )
+                )
+
+        return MixList(status="success", count=len(mixes), mixes=mixes)
+    except Exception as e:
+        raise ToolError(f"Failed to get mixes: {str(e)}")
+
+
+@mcp.tool()
+async def get_mix_tracks(mix_id: str, limit: int = 50) -> MixTracks:
+    """
+    Get tracks from a specific TIDAL personalized mix.
+
+    Args:
+        mix_id: ID of the mix (from get_mixes)
+        limit: Maximum tracks to return (default: 50)
+
+    Returns:
+        List of tracks in the mix
+    """
+    if not await ensure_authenticated():
+        raise ToolError("Not authenticated. Please run the 'login' tool first.")
+
+    try:
+        mix = await anyio.to_thread.run_sync(session.mix, mix_id)
+        items = await anyio.to_thread.run_sync(mix.items)
+        limited = items[:limit] if items else []
+
+        tracks = []
+        for item in limited:
+            if not hasattr(item, "duration"):
+                continue  # skip videos
+            tracks.append(
+                Track(
+                    id=str(item.id),
+                    title=item.name,
+                    artist=item.artist.name if item.artist else "Unknown Artist",
+                    album=item.album.name if item.album else "Unknown Album",
+                    duration_seconds=item.duration,
+                    url=f"https://tidal.com/browse/track/{item.id}",
+                )
+            )
+
+        return MixTracks(
+            status="success",
+            mix_id=mix_id,
+            mix_title=mix.title,
+            count=len(tracks),
+            tracks=tracks,
+        )
+    except ToolError:
+        raise
+    except Exception as e:
+        raise ToolError(f"Failed to get mix tracks: {str(e)}")
+
+
+# =============================================================================
+# Lyrics
+# =============================================================================
+
+@mcp.tool()
+async def get_track_lyrics(track_id: str) -> TrackLyrics:
+    """
+    Get lyrics for a track.
+
+    Args:
+        track_id: ID of the track
+
+    Returns:
+        Plain text lyrics and optionally timestamped LRC subtitles.
+        Raises an error if no lyrics are available for this track.
+    """
+    if not await ensure_authenticated():
+        raise ToolError("Not authenticated. Please run the 'login' tool first.")
+
+    try:
+        track = await anyio.to_thread.run_sync(session.track, track_id)
+        if not track:
+            raise ToolError(f"Track with ID '{track_id}' not found")
+
+        lyrics = await anyio.to_thread.run_sync(track.lyrics)
+
+        return TrackLyrics(
+            status="success",
+            track_id=track_id,
+            text=lyrics.text,
+            subtitles=lyrics.subtitles or None,
+            right_to_left=bool(lyrics.right_to_left),
+        )
+    except ToolError:
+        raise
+    except Exception as e:
+        msg = str(e)
+        if "no lyrics" in msg.lower() or "metadata" in msg.lower():
+            raise ToolError(f"No lyrics available for track {track_id}")
+        raise ToolError(f"Failed to get lyrics: {msg}")
+
+
+# =============================================================================
+# Favorite Playlists
+# =============================================================================
+
+@mcp.tool()
+async def get_favorite_playlists(limit: int = 50) -> PlaylistList:
+    """
+    Get user's favorite (saved) playlists from TIDAL.
+
+    Args:
+        limit: Maximum playlists to retrieve (default: 50, max enforced by TIDAL: 50)
+
+    Returns:
+        List of saved playlists
+    """
+    if not await ensure_authenticated():
+        raise ToolError("Not authenticated. Please run the 'login' tool first.")
+
+    try:
+        limit = min(limit, 50)
+        favorites = await anyio.to_thread.run_sync(
+            lambda: session.user.favorites.playlists(limit=limit)
+        )
+
+        playlists = []
+        for p in favorites:
+            creator_name = None
+            if hasattr(p, "creator") and p.creator:
+                creator_name = getattr(p.creator, "name", None)
+            playlists.append(
+                Playlist(
+                    id=str(p.id),
+                    name=p.name,
+                    description=getattr(p, "description", "") or "",
+                    track_count=getattr(p, "num_tracks", 0),
+                    creator=creator_name,
+                    url=f"https://tidal.com/browse/playlist/{p.id}",
+                )
+            )
+
+        return PlaylistList(status="success", count=len(playlists), playlists=playlists)
+    except Exception as e:
+        raise ToolError(f"Failed to get favorite playlists: {str(e)}")
+
+
+@mcp.tool()
+async def add_playlist_to_favorites(playlist_id: str) -> AddToFavoritesResult:
+    """
+    Save a playlist to user's favorites.
+
+    Args:
+        playlist_id: UUID of the playlist to save
+
+    Returns:
+        Success status and confirmation
+    """
+    if not await ensure_authenticated():
+        raise ToolError("Not authenticated. Please run the 'login' tool first.")
+
+    try:
+        await anyio.to_thread.run_sync(
+            session.user.favorites.add_playlist, playlist_id
+        )
+
+        return AddToFavoritesResult(
+            status="success",
+            item_id=playlist_id,
+            item_type="playlist",
+            message=f"Playlist {playlist_id} added to favorites",
+        )
+    except Exception as e:
+        raise ToolError(f"Failed to add playlist to favorites: {str(e)}")
+
+
+@mcp.tool()
+async def remove_playlist_from_favorites(playlist_id: str) -> RemoveFromFavoritesResult:
+    """
+    Remove a playlist from user's favorites.
+
+    Args:
+        playlist_id: UUID of the playlist to remove
+
+    Returns:
+        Success status and confirmation
+    """
+    if not await ensure_authenticated():
+        raise ToolError("Not authenticated. Please run the 'login' tool first.")
+
+    try:
+        await anyio.to_thread.run_sync(
+            session.user.favorites.remove_playlist, playlist_id
+        )
+
+        return RemoveFromFavoritesResult(
+            status="success",
+            item_id=playlist_id,
+            item_type="playlist",
+            message=f"Playlist {playlist_id} removed from favorites",
+        )
+    except Exception as e:
+        raise ToolError(f"Failed to remove playlist from favorites: {str(e)}")
+
+
+# =============================================================================
+# Favorite Mixes
+# =============================================================================
+
+@mcp.tool()
+async def get_favorite_mixes(limit: int = 50) -> MixList:
+    """
+    Get user's favorite mixes & radios from TIDAL.
+
+    Args:
+        limit: Maximum mixes to retrieve (default: 50)
+
+    Returns:
+        List of saved mixes
+    """
+    if not await ensure_authenticated():
+        raise ToolError("Not authenticated. Please run the 'login' tool first.")
+
+    try:
+        favorites = await anyio.to_thread.run_sync(
+            lambda: session.user.favorites.mixes(limit=limit)
+        )
+
+        mixes = [
+            MixInfo(
+                id=m.id,
+                title=m.title or "",
+                sub_title=getattr(m, "sub_title", "") or "",
+            )
+            for m in favorites
+            if m.id
+        ]
+
+        return MixList(status="success", count=len(mixes), mixes=mixes)
+    except Exception as e:
+        raise ToolError(f"Failed to get favorite mixes: {str(e)}")
+
+
+@mcp.tool()
+async def add_mix_to_favorites(mix_id: str) -> AddToFavoritesResult:
+    """
+    Save a mix to user's favorites.
+
+    Args:
+        mix_id: ID of the mix to save (from get_mixes or get_artist_radio)
+
+    Returns:
+        Success status and confirmation
+    """
+    if not await ensure_authenticated():
+        raise ToolError("Not authenticated. Please run the 'login' tool first.")
+
+    try:
+        await anyio.to_thread.run_sync(
+            session.user.favorites.add_mixes, mix_id
+        )
+
+        return AddToFavoritesResult(
+            status="success",
+            item_id=mix_id,
+            item_type="mix",
+            message=f"Mix {mix_id} added to favorites",
+        )
+    except Exception as e:
+        raise ToolError(f"Failed to add mix to favorites: {str(e)}")
+
+
+@mcp.tool()
+async def remove_mix_from_favorites(mix_id: str) -> RemoveFromFavoritesResult:
+    """
+    Remove a mix from user's favorites.
+
+    Args:
+        mix_id: ID of the mix to remove
+
+    Returns:
+        Success status and confirmation
+    """
+    if not await ensure_authenticated():
+        raise ToolError("Not authenticated. Please run the 'login' tool first.")
+
+    try:
+        await anyio.to_thread.run_sync(
+            session.user.favorites.remove_mixes, mix_id
+        )
+
+        return RemoveFromFavoritesResult(
+            status="success",
+            item_id=mix_id,
+            item_type="mix",
+            message=f"Mix {mix_id} removed from favorites",
+        )
+    except Exception as e:
+        raise ToolError(f"Failed to remove mix from favorites: {str(e)}")
 
 
 # =============================================================================
