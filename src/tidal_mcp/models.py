@@ -312,3 +312,12 @@ class MovedToFolderResult(BaseModel):
     folder_id: str = Field(description="ID of the destination folder")
     folder_name: str = Field(description="Name of the destination folder")
     message: str = Field(description="Status message")
+
+
+class ShufflePlaylistResult(BaseModel):
+    """Result of shuffling a playlist."""
+
+    status: str = Field(description="Operation status (success/error)")
+    playlist_id: str = Field(description="ID of the shuffled playlist")
+    track_count: int = Field(description="Number of tracks shuffled")
+    message: str = Field(description="Status message")

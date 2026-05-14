@@ -55,6 +55,8 @@ from .models import (
     FolderList,
     CreateFolderResult,
     MovedToFolderResult,
+    # Shuffle
+    ShufflePlaylistResult,
 )
 
 
@@ -2003,6 +2005,65 @@ async def remove_mix_from_favorites(mix_id: str) -> RemoveFromFavoritesResult:
         )
     except Exception as e:
         raise ToolError(f"Failed to remove mix from favorites: {str(e)}")
+
+
+# =============================================================================
+# Playlist Shuffle
+# =============================================================================
+
+@mcp.tool()
+async def shuffle_playlist(playlist_id: str) -> ShufflePlaylistResult:
+    """
+    Shuffle the tracks of a playlist randomly using position moves.
+
+    Uses a selection shuffle (move_by_indices) directly on Tidal's API
+    to guarantee the randomized order is saved server-side.
+
+    Args:
+        playlist_id: ID of the playlist to shuffle
+
+    Returns:
+        Confirmation with number of tracks shuffled
+    """
+    import random
+
+    if not await ensure_authenticated():
+        raise ToolError("Not authenticated. Please run the 'login' tool first.")
+
+    try:
+        playlist = await anyio.to_thread.run_sync(session.playlist, playlist_id)
+        if not playlist:
+            raise ToolError(f"Playlist '{playlist_id}' not found")
+
+        n = playlist.num_tracks
+        if n <= 1:
+            return ShufflePlaylistResult(
+                status="success",
+                playlist_id=playlist_id,
+                track_count=n,
+                message="Nothing to shuffle (playlist has 0 or 1 track)",
+            )
+
+        # Selection shuffle: for each position i, pick a random j >= i
+        # and move that item to position i.
+        # move_by_indices calls _reparse() after each move so indices stay valid.
+        for i in range(n - 1):
+            j = random.randint(i, n - 1)
+            if j != i:
+                await anyio.to_thread.run_sync(
+                    lambda _i=i, _j=j: playlist.move_by_indices([_j], _i)
+                )
+
+        return ShufflePlaylistResult(
+            status="success",
+            playlist_id=playlist_id,
+            track_count=n,
+            message=f"Playlist shuffled ({n} tracks reordered)",
+        )
+    except ToolError:
+        raise
+    except Exception as e:
+        raise ToolError(f"Failed to shuffle playlist: {str(e)}")
 
 
 # =============================================================================
