@@ -55,6 +55,8 @@ from .models import (
     FolderList,
     CreateFolderResult,
     MovedToFolderResult,
+    RenameFolderResult,
+    DeleteFolderResult,
     # Shuffle
     ShufflePlaylistResult,
 )
@@ -2005,6 +2007,120 @@ async def remove_mix_from_favorites(mix_id: str) -> RemoveFromFavoritesResult:
         )
     except Exception as e:
         raise ToolError(f"Failed to remove mix from favorites: {str(e)}")
+
+
+# =============================================================================
+# Folder Contents & Management (rename / delete)
+# =============================================================================
+
+@mcp.tool()
+async def get_folder_contents(folder_id: str, limit: int = 50) -> PlaylistList:
+    """
+    Get the playlists inside a specific folder.
+
+    Args:
+        folder_id: ID of the folder (from get_folders)
+        limit: Maximum playlists to return (default: 50)
+
+    Returns:
+        List of playlists in the folder
+    """
+    if not await ensure_authenticated():
+        raise ToolError("Not authenticated. Please run the 'login' tool first.")
+
+    try:
+        folder = await anyio.to_thread.run_sync(session.folder, folder_id)
+
+        items = await anyio.to_thread.run_sync(
+            lambda: folder.items(limit=limit)
+        )
+
+        playlists = []
+        for p in items:
+            creator_name = None
+            if hasattr(p, "creator") and p.creator:
+                creator_name = getattr(p.creator, "name", None)
+            playlists.append(
+                Playlist(
+                    id=str(p.id),
+                    name=p.name,
+                    description=getattr(p, "description", "") or "",
+                    track_count=getattr(p, "num_tracks", 0),
+                    creator=creator_name,
+                    url=f"https://tidal.com/browse/playlist/{p.id}",
+                )
+            )
+
+        return PlaylistList(
+            status="success",
+            count=len(playlists),
+            playlists=playlists,
+        )
+    except ToolError:
+        raise
+    except Exception as e:
+        raise ToolError(f"Failed to get folder contents: {str(e)}")
+
+
+@mcp.tool()
+async def rename_folder(folder_id: str, name: str) -> RenameFolderResult:
+    """
+    Rename a playlist folder.
+
+    Args:
+        folder_id: ID of the folder to rename (from get_folders)
+        name: New name for the folder
+
+    Returns:
+        Confirmation with new folder name
+    """
+    if not await ensure_authenticated():
+        raise ToolError("Not authenticated. Please run the 'login' tool first.")
+
+    try:
+        folder = await anyio.to_thread.run_sync(session.folder, folder_id)
+        await anyio.to_thread.run_sync(folder.rename, name)
+
+        return RenameFolderResult(
+            status="success",
+            folder_id=folder_id,
+            new_name=name,
+            message=f"Folder renamed to '{name}'",
+        )
+    except ToolError:
+        raise
+    except Exception as e:
+        raise ToolError(f"Failed to rename folder: {str(e)}")
+
+
+@mcp.tool()
+async def delete_folder(folder_id: str) -> DeleteFolderResult:
+    """
+    Delete a playlist folder (playlists inside are moved to root, not deleted).
+
+    Args:
+        folder_id: ID of the folder to delete (from get_folders)
+
+    Returns:
+        Confirmation of deletion
+    """
+    if not await ensure_authenticated():
+        raise ToolError("Not authenticated. Please run the 'login' tool first.")
+
+    try:
+        folder = await anyio.to_thread.run_sync(session.folder, folder_id)
+        folder_name = folder.name or folder_id
+        await anyio.to_thread.run_sync(folder.remove)
+
+        return DeleteFolderResult(
+            status="success",
+            folder_id=folder_id,
+            message=f"Folder '{folder_name}' deleted (playlists moved to root)",
+        )
+    except ToolError:
+        raise
+    except Exception as e:
+        raise ToolError(f"Failed to delete folder: {str(e)}")
 
 
 # =============================================================================

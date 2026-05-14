@@ -321,3 +321,20 @@ class ShufflePlaylistResult(BaseModel):
     playlist_id: str = Field(description="ID of the shuffled playlist")
     track_count: int = Field(description="Number of tracks shuffled")
     message: str = Field(description="Status message")
+
+
+class RenameFolderResult(BaseModel):
+    """Result of renaming a folder."""
+
+    status: str = Field(description="Operation status (success/error)")
+    folder_id: str = Field(description="ID of the renamed folder")
+    new_name: str = Field(description="New name of the folder")
+    message: str = Field(description="Status message")
+
+
+class DeleteFolderResult(BaseModel):
+    """Result of deleting a folder."""
+
+    status: str = Field(description="Operation status (success/error)")
+    folder_id: str = Field(description="ID of the deleted folder")
+    message: str = Field(description="Status message")
