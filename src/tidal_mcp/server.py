@@ -50,6 +50,11 @@ from .models import (
     MixTracks,
     # Lyrics
     TrackLyrics,
+    # Folders
+    FolderInfo,
+    FolderList,
+    CreateFolderResult,
+    MovedToFolderResult,
 )
 
 
@@ -1998,6 +2003,123 @@ async def remove_mix_from_favorites(mix_id: str) -> RemoveFromFavoritesResult:
         )
     except Exception as e:
         raise ToolError(f"Failed to remove mix from favorites: {str(e)}")
+
+
+# =============================================================================
+# Folder Management
+# =============================================================================
+
+@mcp.tool()
+async def get_folders() -> FolderList:
+    """
+    List all playlist folders in the user's TIDAL collection.
+
+    Returns:
+        List of folders with id, name, and number of playlists inside.
+        Use the folder id with move_playlist_to_folder or create_playlist_in_folder.
+    """
+    if not await ensure_authenticated():
+        raise ToolError("Not authenticated. Please run the 'login' tool first.")
+
+    try:
+        params = {
+            "folderId": "root",
+            "offset": 0,
+            "limit": 50,
+            "order": "NAME",
+            "includeOnly": "FOLDER",
+        }
+        response = await anyio.to_thread.run_sync(
+            lambda: session.request.request(
+                "GET",
+                "my-collection/playlists/folders",
+                base_url=session.config.api_v2_location,
+                params=params,
+            )
+        )
+        items = response.json().get("items", [])
+
+        folders = []
+        for item in items:
+            data = item.get("data", {})
+            folder_id = data.get("id")
+            name = item.get("name") or data.get("name", "")
+            total = data.get("totalNumberOfItems", 0)
+            if folder_id:
+                folders.append(
+                    FolderInfo(id=folder_id, name=name, total_items=total)
+                )
+
+        return FolderList(status="success", count=len(folders), folders=folders)
+    except Exception as e:
+        raise ToolError(f"Failed to get folders: {str(e)}")
+
+
+@mcp.tool()
+async def create_folder(name: str) -> CreateFolderResult:
+    """
+    Create a new playlist folder in the user's TIDAL collection.
+
+    Args:
+        name: Name of the folder to create
+
+    Returns:
+        Created folder details including id
+    """
+    if not await ensure_authenticated():
+        raise ToolError("Not authenticated. Please run the 'login' tool first.")
+
+    try:
+        folder = await anyio.to_thread.run_sync(
+            session.user.create_folder, name
+        )
+
+        return CreateFolderResult(
+            status="success",
+            folder=FolderInfo(
+                id=folder.id,
+                name=folder.name or name,
+                total_items=folder.total_number_of_items or 0,
+            ),
+            message=f"Folder '{name}' created",
+        )
+    except Exception as e:
+        raise ToolError(f"Failed to create folder: {str(e)}")
+
+
+@mcp.tool()
+async def move_playlist_to_folder(playlist_id: str, folder_id: str) -> MovedToFolderResult:
+    """
+    Move a playlist into a folder.
+
+    Args:
+        playlist_id: UUID of the playlist to move
+        folder_id: ID of the destination folder (from get_folders)
+
+    Returns:
+        Confirmation with folder name
+    """
+    if not await ensure_authenticated():
+        raise ToolError("Not authenticated. Please run the 'login' tool first.")
+
+    try:
+        folder = await anyio.to_thread.run_sync(
+            session.folder, folder_id
+        )
+
+        await anyio.to_thread.run_sync(
+            lambda: folder.add_items([playlist_id])
+        )
+
+        return MovedToFolderResult(
+            status="success",
+            playlist_id=playlist_id,
+            folder_id=folder_id,
+            folder_name=folder.name or folder_id,
+            message=f"Playlist moved to folder '{folder.name}'",
+        )
+    except Exception as e:
+        raise ToolError(f"Failed to move playlist to folder: {str(e)}")
 
 
 # =============================================================================

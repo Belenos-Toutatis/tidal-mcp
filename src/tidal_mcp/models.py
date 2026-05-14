@@ -274,3 +274,41 @@ class TrackLyrics(BaseModel):
     text: str = Field(description="Plain text lyrics")
     subtitles: Optional[str] = Field(None, description="Timestamped lyrics in LRC format")
     right_to_left: bool = Field(description="True if lyrics language reads right-to-left")
+
+
+# =============================================================================
+# Folder Models
+# =============================================================================
+
+class FolderInfo(BaseModel):
+    """A TIDAL playlist folder."""
+
+    id: str = Field(description="Unique folder ID")
+    name: str = Field(description="Folder name")
+    total_items: int = Field(description="Number of playlists in this folder")
+
+
+class FolderList(BaseModel):
+    """List of playlist folders."""
+
+    status: str = Field(description="Operation status (success/error)")
+    count: int = Field(description="Number of folders returned")
+    folders: List[FolderInfo] = Field(description="List of folder objects")
+
+
+class CreateFolderResult(BaseModel):
+    """Result of creating a folder."""
+
+    status: str = Field(description="Operation status (success/error)")
+    folder: FolderInfo = Field(description="Created folder details")
+    message: str = Field(description="Status message")
+
+
+class MovedToFolderResult(BaseModel):
+    """Result of moving a playlist into a folder."""
+
+    status: str = Field(description="Operation status (success/error)")
+    playlist_id: str = Field(description="ID of the moved playlist")
+    folder_id: str = Field(description="ID of the destination folder")
+    folder_name: str = Field(description="Name of the destination folder")
+    message: str = Field(description="Status message")
