@@ -2014,10 +2014,10 @@ async def remove_mix_from_favorites(mix_id: str) -> RemoveFromFavoritesResult:
 @mcp.tool()
 async def shuffle_playlist(playlist_id: str) -> ShufflePlaylistResult:
     """
-    Shuffle the tracks of a playlist randomly using position moves.
+    Shuffle the tracks of a playlist randomly.
 
-    Uses a selection shuffle (move_by_indices) directly on Tidal's API
-    to guarantee the randomized order is saved server-side.
+    Reads the current tracks, clears the playlist, then re-adds all
+    tracks in a randomized order. The new order is persisted on Tidal.
 
     Args:
         playlist_id: ID of the playlist to shuffle
@@ -2035,7 +2035,11 @@ async def shuffle_playlist(playlist_id: str) -> ShufflePlaylistResult:
         if not playlist:
             raise ToolError(f"Playlist '{playlist_id}' not found")
 
-        n = playlist.num_tracks
+        # 1. Fetch current tracks
+        tracks = await anyio.to_thread.run_sync(playlist.tracks)
+        track_ids = [str(t.id) for t in tracks]
+        n = len(track_ids)
+
         if n <= 1:
             return ShufflePlaylistResult(
                 status="success",
@@ -2044,15 +2048,17 @@ async def shuffle_playlist(playlist_id: str) -> ShufflePlaylistResult:
                 message="Nothing to shuffle (playlist has 0 or 1 track)",
             )
 
-        # Selection shuffle: for each position i, pick a random j >= i
-        # and move that item to position i.
-        # move_by_indices calls _reparse() after each move so indices stay valid.
-        for i in range(n - 1):
-            j = random.randint(i, n - 1)
-            if j != i:
-                await anyio.to_thread.run_sync(
-                    lambda _i=i, _j=j: playlist.move_by_indices([_j], _i)
-                )
+        # 2. Shuffle
+        random.shuffle(track_ids)
+
+        # 3. Clear playlist (uses remove_by_indices in chunks of 50)
+        await anyio.to_thread.run_sync(playlist.clear)
+
+        # 4. Re-add in shuffled order (single batch call at position 0)
+        track_ids_int = [int(tid) for tid in track_ids]
+        await anyio.to_thread.run_sync(
+            lambda: playlist.add(track_ids_int, position=0)
+        )
 
         return ShufflePlaylistResult(
             status="success",
