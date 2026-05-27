@@ -185,6 +185,31 @@ tidal-mcp/
 - `tidalapi>=0.8.6` — TIDAL API client
 - `anyio>=4.0.0` — Async utilities
 
+## Robustness
+
+The server includes a built-in resilience layer (`robustness.py`) applied to every
+Tidal API call:
+
+- **Rate limiting** — minimum 50 ms between calls
+- **Timeout** — 15 seconds per HTTP request
+- **Retry with exponential backoff** — up to 3 attempts (1 s → 2 s → 4 s) on `ConnectionError`, `Timeout`, HTTP 429 or 503
+- **Auto token refresh** — on HTTP 401, the OAuth token is refreshed and the request retried once
+- **Persistent logging** — all API calls written to `tidal-mcp.log` (rotated at 5 MB, 3 files kept)
+
+Log level via environment variable:
+
+```bash
+TIDAL_MCP_LOG_LEVEL=DEBUG   # DEBUG / INFO / WARN / ERROR (default: INFO)
+```
+
+Sample log lines:
+
+```
+[2026-05-28 14:32:01] [DEBUG] GET search - 154ms - HTTP 200
+[2026-05-28 14:32:03] [WARN]  GET tracks/1234/lyrics - HTTP 429 after 287ms, retry 1/3 in 1s
+[2026-05-28 14:32:08] [INFO]  Token refreshed successfully
+```
+
 ## Troubleshooting
 
 ### Authentication fails
@@ -199,6 +224,10 @@ tidal-mcp/
 
 ### 412 errors on playlist operations
 - This is a Tidal ETag conflict — retry the operation
+
+### Diagnosing failures
+- Check `tidal-mcp.log` in the project root — every API call is logged with timing and status
+- Increase verbosity with `TIDAL_MCP_LOG_LEVEL=DEBUG`
 
 ## License
 

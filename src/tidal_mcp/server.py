@@ -16,6 +16,8 @@ import tidalapi
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 
+from .robustness import apply_robustness, get_logger
+
 from .models import (
     # Core entities
     Track,
@@ -128,6 +130,26 @@ SESSION_FILE = SESSION_DIR / "session.json"
 
 # Global session instance (single-user design)
 session = tidalapi.Session()
+
+
+def _persist_session() -> None:
+    """Save current OAuth tokens to disk. Used as the refresh callback."""
+    try:
+        session_data = {
+            "token_type": {"data": session.token_type or "Bearer"},
+            "session_id": {"data": session.session_id or ""},
+            "access_token": {"data": session.access_token},
+            "refresh_token": {"data": session.refresh_token},
+            "is_pkce": {"data": session.is_pkce},
+        }
+        SESSION_FILE.write_text(json.dumps(session_data))
+    except Exception as e:
+        get_logger().warning(f"Could not write session file: {e}")
+
+
+# Apply robustness layer: logging, rate limit, timeout, retry, token refresh.
+# Must run after `session` is created, before any tool can be called.
+apply_robustness(session, PROJECT_ROOT, save_session_callback=_persist_session)
 
 
 # =============================================================================
