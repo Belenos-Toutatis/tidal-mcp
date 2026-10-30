@@ -993,15 +993,17 @@ async def add_tracks_to_playlist(playlist_id: str, track_ids: List[str]) -> AddT
             raise ToolError(f"Playlist with ID '{playlist_id}' not found")
 
         track_ids_int = [int(tid) for tid in track_ids]
-        await anyio.to_thread.run_sync(playlist.add, track_ids_int)
+        added = await anyio.to_thread.run_sync(playlist.add, track_ids_int)
+        skipped = len(track_ids) - len(added)
 
         return AddTracksResult(
             status="success",
             playlist_id=playlist_id,
             playlist_name=playlist.name,
-            tracks_added=len(track_ids),
+            tracks_added=len(added),
             playlist_url=f"https://tidal.com/browse/playlist/{playlist_id}",
-            message=f"Added {len(track_ids)} tracks to playlist '{playlist.name}'",
+            message=f"Added {len(added)} tracks to playlist '{playlist.name}'"
+            + (f" ({skipped} already present, skipped)" if skipped else ""),
         )
     except ValueError as e:
         raise ToolError(f"Invalid track ID format: {str(e)}")
