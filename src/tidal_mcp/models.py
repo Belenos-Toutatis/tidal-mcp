@@ -5,7 +5,7 @@ These models provide type-safe, well-documented structures for all tool response
 Following MCP best practices: minimal transformation, clear descriptions.
 """
 
-from typing import List, Optional
+from typing import Dict, List, Optional
 from pydantic import BaseModel, Field
 
 
@@ -52,6 +52,9 @@ class Playlist(BaseModel):
     description: str = Field(description="Playlist description")
     track_count: int = Field(description="Number of tracks in playlist")
     creator: Optional[str] = Field(None, description="Playlist creator name")
+    creator_id: Optional[str] = Field(
+        None, description="TIDAL user ID of the creator (use with get_user_profile)"
+    )
     url: str = Field(description="TIDAL web URL for the playlist")
 
 
@@ -337,4 +340,324 @@ class DeleteFolderResult(BaseModel):
 
     status: str = Field(description="Operation status (success/error)")
     folder_id: str = Field(description="ID of the deleted folder")
+    message: str = Field(description="Status message")
+
+
+# =============================================================================
+# Catalog Detail Models
+# =============================================================================
+
+class AudioQuality(BaseModel):
+    """Audio quality tiers TIDAL offers for a track or album."""
+
+    max_quality: Optional[str] = Field(
+        None, description="Highest tier available (HIGH, LOSSLESS, HI_RES_LOSSLESS)"
+    )
+    media_tags: List[str] = Field(
+        description="Raw TIDAL quality tags (LOSSLESS, HIRES_LOSSLESS, DOLBY_ATMOS...)"
+    )
+    audio_modes: List[str] = Field(description="Audio modes (STEREO, DOLBY_ATMOS...)")
+    lossless: bool = Field(description="True if a lossless FLAC version exists")
+    hi_res: bool = Field(description="True if a Hi-Res (24-bit) version exists")
+    dolby_atmos: bool = Field(description="True if a Dolby Atmos version exists")
+    summary: str = Field(description="Human-readable description of the best quality")
+
+
+class TrackDetails(BaseModel):
+    """Detailed track information."""
+
+    status: str = Field(description="Operation status (success/error)")
+    track: Track = Field(description="Track basic information")
+    version: Optional[str] = Field(None, description="Version label (e.g. 'Remastered 2011')")
+    isrc: Optional[str] = Field(None, description="International Standard Recording Code")
+    explicit: bool = Field(description="True if the track is marked explicit")
+    popularity: Optional[int] = Field(None, description="TIDAL popularity score (0-100)")
+    track_number: Optional[int] = Field(None, description="Position on its album")
+    volume_number: Optional[int] = Field(None, description="Disc number on its album")
+    release_date: Optional[str] = Field(None, description="Album release date (YYYY-MM-DD)")
+    copyright: Optional[str] = Field(None, description="Copyright notice")
+    available: bool = Field(description="True if the track can currently be streamed")
+    quality: AudioQuality = Field(description="Available audio quality tiers")
+
+
+class AudioQualityResult(BaseModel):
+    """Audio quality of a track or album."""
+
+    status: str = Field(description="Operation status (success/error)")
+    item_type: str = Field(description="Type of item (track/album)")
+    item_id: str = Field(description="ID of the item")
+    title: str = Field(description="Track or album title")
+    artist: str = Field(description="Primary artist name")
+    quality: AudioQuality = Field(description="Available audio quality tiers")
+
+
+class AlbumReview(BaseModel):
+    """Editorial review of an album."""
+
+    status: str = Field(description="Operation status (success/error)")
+    album_id: str = Field(description="ID of the album")
+    album_title: str = Field(description="Title of the album")
+    artist: str = Field(description="Album artist name")
+    text: str = Field(description="Review text")
+
+
+class ImageUrls(BaseModel):
+    """Image URLs for a TIDAL item, by size."""
+
+    status: str = Field(description="Operation status (success/error)")
+    item_type: str = Field(description="Type of item (album/artist/playlist/mix/user)")
+    item_id: str = Field(description="ID of the item")
+    name: str = Field(description="Name of the item")
+    urls: Dict[str, str] = Field(description="Image URL keyed by size (e.g. '640x640')")
+
+
+# =============================================================================
+# User Models
+# =============================================================================
+
+class UserProfile(BaseModel):
+    """Public profile of a TIDAL user."""
+
+    status: str = Field(description="Operation status (success/error)")
+    id: str = Field(description="TIDAL user ID")
+    name: str = Field(description="Display name")
+    handle: Optional[str] = Field(None, description="Profile handle, if set")
+    followers: int = Field(description="Number of followers")
+    follows: int = Field(description="Number of profiles followed")
+    profile_type: Optional[str] = Field(None, description="Profile type (USER_PROFILE...)")
+    picture_url: Optional[str] = Field(None, description="Profile picture URL (600x600)")
+
+
+class FavoriteCounts(BaseModel):
+    """Number of items in each favorites collection."""
+
+    status: str = Field(description="Operation status (success/error)")
+    tracks: int = Field(description="Number of favorite tracks")
+    albums: int = Field(description="Number of favorite albums")
+    artists: int = Field(description="Number of followed artists")
+    playlists: int = Field(description="Number of favorite playlists (TIDAL counts folders too)")
+
+
+# =============================================================================
+# Editorial Page Models
+# =============================================================================
+
+class PageEntry(BaseModel):
+    """One item inside an editorial page section."""
+
+    type: str = Field(
+        description="Item type: track, album, artist, playlist, mix, link (another page), "
+        "external (web link) or text"
+    )
+    id: Optional[str] = Field(None, description="TIDAL ID, usable with the matching tools")
+    title: str = Field(description="Item title or name")
+    subtitle: Optional[str] = Field(None, description="Artist, creator or short description")
+    path: Optional[str] = Field(None, description="Page path to pass to browse_page (links)")
+    url: Optional[str] = Field(None, description="Web URL")
+
+
+class PageSection(BaseModel):
+    """A section (row) of an editorial page, with a preview of its items."""
+
+    index: int = Field(description="Section index, usable with get_page_section")
+    title: str = Field(description="Section title")
+    item_count: int = Field(description="Number of items in this section on the page")
+    more_path: Optional[str] = Field(
+        None, description="Page path listing the full section; pass to browse_page"
+    )
+    items: List[PageEntry] = Field(description="Preview of the section items")
+
+
+class PageView(BaseModel):
+    """An editorial page (Home, Explore, a genre...) split into sections."""
+
+    status: str = Field(description="Operation status (success/error)")
+    page: str = Field(description="Page requested")
+    title: str = Field(description="Page title")
+    count: int = Field(description="Number of sections")
+    sections: List[PageSection] = Field(description="Sections of the page")
+
+
+class PageSectionItems(BaseModel):
+    """All items of one editorial page section."""
+
+    status: str = Field(description="Operation status (success/error)")
+    page: str = Field(description="Page requested")
+    section_index: int = Field(description="Index of the section")
+    title: str = Field(description="Section title")
+    more_path: Optional[str] = Field(
+        None, description="Page path listing even more items; pass to browse_page"
+    )
+    total: int = Field(description="Number of items in the section")
+    offset: int = Field(description="Offset of the first returned item")
+    count: int = Field(description="Number of items returned")
+    items: List[PageEntry] = Field(description="Section items")
+
+
+# =============================================================================
+# Recommendation & Analysis Models
+# =============================================================================
+
+class RecommendedTrack(Track):
+    """A recommended track with the seeds that led to it."""
+
+    seed_ids: List[str] = Field(description="Seed track IDs whose radio suggested this track")
+
+
+class TrackRecommendations(BaseModel):
+    """Tracks recommended from several seed tracks."""
+
+    status: str = Field(description="Operation status (success/error)")
+    seed_ids: List[str] = Field(description="Seed track IDs used")
+    seeds_without_radio: List[str] = Field(description="Seeds for which TIDAL has no radio")
+    excluded_count: int = Field(
+        description="Distinct suggestions skipped because they are seeds or already in "
+        "the excluded playlist"
+    )
+    count: int = Field(description="Number of tracks returned")
+    tracks: List[RecommendedTrack] = Field(
+        description="Recommended tracks, those suggested by the most seeds first"
+    )
+
+
+class ArtistShare(BaseModel):
+    """How much of a playlist one artist represents."""
+
+    artist: str = Field(description="Artist name")
+    track_count: int = Field(description="Number of tracks by this artist")
+    percent: float = Field(description="Share of the playlist tracks, in percent")
+
+
+class DuplicateOccurrence(BaseModel):
+    """One occurrence of a duplicated song in a playlist."""
+
+    position: int = Field(
+        description="0-based position in the playlist (usable with remove_tracks_from_playlist "
+        "indices)"
+    )
+    track_id: str = Field(description="TIDAL track ID of this occurrence")
+    album: str = Field(description="Album of this occurrence")
+    version: Optional[str] = Field(None, description="Version label, if any")
+
+
+class DuplicateGroup(BaseModel):
+    """A song that appears more than once in a playlist."""
+
+    title: str = Field(description="Track title")
+    artist: str = Field(description="Primary artist name")
+    occurrences: List[DuplicateOccurrence] = Field(description="Every occurrence of the song")
+
+
+class PlaylistAnalysis(BaseModel):
+    """Statistics about a playlist's content."""
+
+    status: str = Field(description="Operation status (success/error)")
+    playlist_id: str = Field(description="ID of the playlist")
+    playlist_name: str = Field(description="Name of the playlist")
+    track_count: int = Field(description="Number of tracks analyzed")
+    truncated: bool = Field(description="True if the playlist was too long to analyze fully")
+    total_duration_seconds: int = Field(description="Total duration in seconds")
+    average_duration_seconds: int = Field(description="Average track duration in seconds")
+    distinct_artists: int = Field(description="Number of distinct primary artists")
+    top_artists: List[ArtistShare] = Field(description="Most represented artists")
+    decades: Dict[str, int] = Field(
+        description="Track count per decade of album release (reissues count at their "
+        "reissue date)"
+    )
+    tracks_without_date: int = Field(description="Tracks with no known release date")
+    explicit_tracks: int = Field(description="Tracks marked explicit")
+    unavailable_tracks: int = Field(description="Tracks that can no longer be streamed")
+    consecutive_same_artist: int = Field(
+        description="Number of times two adjacent tracks share the same artist"
+    )
+    duplicate_count: int = Field(description="Number of songs present more than once")
+    duplicates: List[DuplicateGroup] = Field(
+        description="Songs present more than once (same title and artist, any version)"
+    )
+
+
+class ComparedTrack(BaseModel):
+    """A song in a playlist comparison."""
+
+    title: str = Field(description="Track title")
+    artist: str = Field(description="Primary artist name")
+    track_id_a: Optional[str] = Field(None, description="Track ID in playlist A, if present")
+    track_id_b: Optional[str] = Field(None, description="Track ID in playlist B, if present")
+
+
+class PlaylistComparison(BaseModel):
+    """Songs shared by two playlists and songs unique to each."""
+
+    status: str = Field(description="Operation status (success/error)")
+    playlist_a_id: str = Field(description="ID of playlist A")
+    playlist_a_name: str = Field(description="Name of playlist A")
+    playlist_b_id: str = Field(description="ID of playlist B")
+    playlist_b_name: str = Field(description="Name of playlist B")
+    track_count_a: int = Field(description="Number of tracks in playlist A")
+    track_count_b: int = Field(description="Number of tracks in playlist B")
+    common_count: int = Field(description="Number of distinct songs in both playlists")
+    only_in_a_count: int = Field(description="Number of distinct songs only in A")
+    only_in_b_count: int = Field(description="Number of distinct songs only in B")
+    lists_truncated: bool = Field(description="True if a list below was cut to max_listed")
+    common: List[ComparedTrack] = Field(description="Songs in both playlists")
+    only_in_a: List[ComparedTrack] = Field(description="Songs only in playlist A")
+    only_in_b: List[ComparedTrack] = Field(description="Songs only in playlist B")
+
+
+# =============================================================================
+# Playlist Editing Results
+# =============================================================================
+
+class ClearPlaylistResult(BaseModel):
+    """Result of emptying a playlist."""
+
+    status: str = Field(description="Operation status (success/error)")
+    playlist_id: str = Field(description="ID of the playlist")
+    playlist_name: str = Field(description="Name of the playlist")
+    tracks_removed: int = Field(description="Number of items removed")
+    message: str = Field(description="Status message")
+
+
+class MergePlaylistsResult(BaseModel):
+    """Result of merging one playlist into another."""
+
+    status: str = Field(description="Operation status (success/error)")
+    playlist_id: str = Field(description="ID of the target playlist")
+    playlist_name: str = Field(description="Name of the target playlist")
+    source_playlist_id: str = Field(description="ID of the source playlist")
+    source_playlist_name: str = Field(description="Name of the source playlist")
+    tracks_added: int = Field(description="Number of tracks added to the target")
+    message: str = Field(description="Status message")
+
+
+class MoveTracksResult(BaseModel):
+    """Result of moving tracks inside a playlist."""
+
+    status: str = Field(description="Operation status (success/error)")
+    playlist_id: str = Field(description="ID of the playlist")
+    playlist_name: str = Field(description="Name of the playlist")
+    tracks_moved: int = Field(description="Number of tracks moved")
+    position: int = Field(description="Target position used")
+    message: str = Field(description="Status message")
+
+
+class PlaylistVisibilityResult(BaseModel):
+    """Result of changing a playlist's visibility."""
+
+    status: str = Field(description="Operation status (success/error)")
+    playlist_id: str = Field(description="ID of the playlist")
+    playlist_name: str = Field(description="Name of the playlist")
+    public: bool = Field(description="True if the playlist is now public")
+    message: str = Field(description="Status message")
+
+
+class AddByIsrcResult(BaseModel):
+    """Result of adding tracks to a playlist by ISRC."""
+
+    status: str = Field(description="Operation status (success/error)")
+    playlist_id: str = Field(description="ID of the playlist")
+    playlist_name: str = Field(description="Name of the playlist")
+    tracks_added: int = Field(description="Number of tracks actually added")
+    resolved: List[Track] = Field(description="Track chosen for each ISRC that was found")
+    not_found: List[str] = Field(description="ISRCs with no matching track on TIDAL")
     message: str = Field(description="Status message")

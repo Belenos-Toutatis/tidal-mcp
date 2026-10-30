@@ -1,10 +1,10 @@
 # TIDAL MCP Server
 
-A MCP (Model Context Protocol) server for TIDAL music streaming service. Clean API wrapper following official MCP best practices — thin wrappers around tidalapi methods with no custom business logic.
+A MCP (Model Context Protocol) server for TIDAL music streaming service. Clean API wrapper following official MCP best practices — thin wrappers around tidalapi methods, plus a few derived tools (playlist analysis and comparison, multi-seed recommendations).
 
 ## Features
 
-### 50 Tools
+### 72 Tools
 
 | Category | Tool | Description |
 |----------|------|-------------|
@@ -35,16 +35,37 @@ A MCP (Model Context Protocol) server for TIDAL music streaming service. Clean A
 | | `remove_tracks_from_playlist` | Remove tracks from a playlist |
 | | `update_playlist` | Update name/description |
 | | `shuffle_playlist` | Shuffle tracks randomly |
+| | `move_playlist_tracks` | Move tracks to a new position |
+| | `merge_playlists` | Append another playlist's tracks |
+| | `clear_playlist` | Remove every track |
+| | `set_playlist_visibility` | Make a playlist public or private |
+| | `add_tracks_to_playlist_by_isrc` | Add tracks from ISRC codes |
 | | `delete_playlist` | Delete a playlist |
+| **Playlist analysis** | `analyze_playlist` | Duration, top artists, decades, duplicates |
+| | `compare_playlists` | Shared and unique songs of two playlists |
+| **Tracks** | `get_track` | Track details (ISRC, version, quality) |
+| | `get_tracks_by_isrc` | Every release of a recording |
+| | `get_audio_quality` | Lossless / Hi-Res / Dolby Atmos availability |
 | **Albums** | `get_album` | Get album details |
 | | `get_album_tracks` | Get all tracks from an album |
 | | `get_similar_albums` | Find similar albums |
+| | `get_album_review` | Editorial review |
+| | `get_albums_by_barcode` | Find an album from a CD barcode |
 | **Artists** | `get_artist` | Get artist details with bio |
 | | `get_artist_albums` | Get artist discography |
+| | `get_artist_ep_singles` | EPs and singles |
+| | `get_artist_appearances` | Compilations and guest appearances |
 | | `get_artist_top_tracks` | Get artist's popular tracks |
 | | `get_similar_artists` | Find similar artists |
 | **Radio** | `get_track_radio` | Similar tracks to a seed track |
 | | `get_artist_radio` | Tracks in an artist's style |
+| | `recommend_tracks` | Combine several seeds, skip a playlist's tracks |
+| **Editorial pages** | `browse_page` | Home, Explore, For You, genres, moods, Hi-Res... |
+| | `get_page_section` | All items of one page section |
+| **Users** | `get_user_profile` | Public profile of a user |
+| | `get_user_public_playlists` | A user's public playlists |
+| | `get_favorite_counts` | Size of each favorites collection |
+| **Images** | `get_image_urls` | Covers, photos, playlist and profile pictures |
 | **Editorial** | `get_genres` | List all available genres |
 | | `get_genre_tracks` | Top tracks for a genre |
 | | `get_genre_albums` | Albums for a genre |
@@ -58,6 +79,9 @@ A MCP (Model Context Protocol) server for TIDAL music streaming service. Clean A
 | | `rename_folder` | Rename a folder |
 | | `delete_folder` | Delete a folder |
 | | `move_playlist_to_folder` | Move a playlist into a folder |
+| | `move_playlist_to_root` | Take a playlist out of its folder |
+
+Audio quality is reported as tiers (Lossless, Hi-Res, Dolby Atmos): with the device-code login used here, TIDAL does not expose the exact bit depth and sample rate of a stream.
 
 ## Installation
 
@@ -165,6 +189,24 @@ Sessions are persisted and reused across restarts.
 4. add_mix_to_favorites(mix_id)             → bookmark mix
 ```
 
+### Clean up and extend a playlist
+
+```
+1. analyze_playlist(id)                      → duplicates with positions, top artists
+2. remove_tracks_from_playlist(id, indices=[...]) → drop one copy of each duplicate
+3. recommend_tracks([seed_ids], exclude_playlist_id=id, max_per_artist=2)
+4. add_tracks_to_playlist(id, track_ids)     → extend without repeats
+```
+
+### Browse TIDAL's editorial pages
+
+```
+1. browse_page("explore")                    → sections: Genres, Moods, Decades...
+2. browse_page("pages/genre_jazz")           → follow a link's path
+3. browse_page(section.more_path)            → full list of a section
+4. get_page_section(page, section_index)     → every item of one section
+```
+
 ## Project Structure
 
 ```
@@ -176,7 +218,8 @@ tidal-mcp/
     └── tidal_mcp/
         ├── __init__.py      # Package init
         ├── models.py        # Pydantic response models
-        └── server.py        # MCP server — 50 tools
+        ├── robustness.py    # Rate limit, timeout, retry, token refresh, logging
+        └── server.py        # MCP server — 72 tools
 ```
 
 ## Dependencies

@@ -7,12 +7,16 @@ No custom business logic - thin wrappers around tidalapi methods.
 """
 
 import json
+import re
 import webbrowser
+from collections import Counter
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Literal, Optional, Tuple
 
 import anyio
 import tidalapi
+import tidalapi.page
+from tidalapi.exceptions import ObjectNotFound
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 
@@ -61,6 +65,35 @@ from .models import (
     DeleteFolderResult,
     # Shuffle
     ShufflePlaylistResult,
+    # Catalog details
+    AudioQuality,
+    TrackDetails,
+    AudioQualityResult,
+    AlbumReview,
+    ImageUrls,
+    # Users & favorites
+    UserProfile,
+    FavoriteCounts,
+    # Editorial pages
+    PageEntry,
+    PageSection,
+    PageView,
+    PageSectionItems,
+    # Recommendations & analysis
+    RecommendedTrack,
+    TrackRecommendations,
+    ArtistShare,
+    DuplicateOccurrence,
+    DuplicateGroup,
+    PlaylistAnalysis,
+    ComparedTrack,
+    PlaylistComparison,
+    # Playlist editing
+    ClearPlaylistResult,
+    MergePlaylistsResult,
+    MoveTracksResult,
+    PlaylistVisibilityResult,
+    AddByIsrcResult,
 )
 
 
@@ -114,6 +147,30 @@ A traditional MCP server that exposes TIDAL API functionality as clean tool wrap
 ## Recommendations
 - get_track_radio: Get tracks similar to a seed track
 - get_artist_radio: Get tracks based on an artist's style
+- recommend_tracks: Combine several seed tracks, skipping a playlist's tracks
+
+## Catalog Details
+- get_track: Track details (ISRC, version, release date, quality)
+- get_audio_quality: Lossless / Hi-Res / Dolby Atmos availability
+- get_tracks_by_isrc: Every release of a recording
+- get_albums_by_barcode: Album from a CD barcode
+- get_album_review: Editorial album review
+- get_artist_ep_singles / get_artist_appearances: Rest of a discography
+- get_image_urls: Covers, artist photos, playlist and profile pictures
+
+## Editorial Pages
+- browse_page: Home, Explore, For You, genres, moods, Hi-Res... section by section
+- get_page_section: All items of one section; follow 'path' / 'more_path' with browse_page
+
+## Playlist Analysis & Editing
+- analyze_playlist: Duration, top artists, decades, duplicates with positions
+- compare_playlists: Shared and unique songs of two playlists
+- clear_playlist, merge_playlists, move_playlist_tracks, set_playlist_visibility
+- add_tracks_to_playlist_by_isrc, move_playlist_to_root
+
+## Users
+- get_user_profile, get_user_public_playlists: use a playlist's creator_id
+- get_favorite_counts: Size of each favorites collection
 """
 
 # Initialize MCP server
@@ -187,6 +244,291 @@ async def ensure_authenticated() -> bool:
             return False
 
     return await anyio.to_thread.run_sync(session.check_login)
+
+
+# =============================================================================
+# Shared Helpers (extended tools)
+# =============================================================================
+
+READ_ONLY = {"readOnlyHint": True, "openWorldHint": True}
+MAX_PLAYLIST_ITEMS = 2000
+ISRC_PATTERN = re.compile(r"^[A-Z]{2}[A-Z0-9]{3}[0-9]{7}$")
+WIMP_LINK_PATTERN = re.compile(r"\[wimpLink[^\]]*\](.*?)\[/wimpLink\]", re.DOTALL)
+
+PAGE_PATHS = {
+    "explore": "pages/explore",
+    "for_you": "pages/for_you",
+    "hires": "pages/hires",
+    "genres": "pages/genre_page",
+    "local_genres": "pages/genre_page_local",
+    "moods": "pages/moods",
+    "mixes": "pages/my_collection_my_mixes",
+}
+
+IMAGE_SIZES = {
+    "album": [80, 160, 320, 640, 1280],
+    "artist": [160, 320, 480, 750],
+    "playlist": [160, 320, 480, 640, 750, 1080],
+    "mix": [320, 640, 1500],
+    "user": [100, 210, 600],
+}
+PLAYLIST_WIDE_SIZES = [(480, 320), (1080, 720)]
+
+
+def _date_str(value) -> Optional[str]:
+    return value.strftime("%Y-%m-%d") if value else None
+
+
+def _primary_artist(item) -> str:
+    return item.artist.name if getattr(item, "artist", None) else "Unknown Artist"
+
+
+def _creator_id(playlist) -> Optional[str]:
+    # Editorial playlists carry a placeholder creator with id 0.
+    creator_id = getattr(getattr(playlist, "creator", None), "id", None)
+    return str(creator_id) if creator_id else None
+
+
+def _track_model(t) -> Track:
+    return Track(
+        id=str(t.id),
+        title=t.name,
+        artist=_primary_artist(t),
+        album=t.album.name if t.album else "Unknown Album",
+        duration_seconds=t.duration or 0,
+        url=f"https://tidal.com/browse/track/{t.id}",
+    )
+
+
+def _album_model(a) -> Album:
+    return Album(
+        id=str(a.id),
+        title=a.name,
+        artist=_primary_artist(a),
+        release_date=_date_str(getattr(a, "release_date", None)),
+        num_tracks=getattr(a, "num_tracks", 0) or 0,
+        duration_seconds=getattr(a, "duration", 0) or 0,
+        url=f"https://tidal.com/browse/album/{a.id}",
+    )
+
+
+def _playlist_model(p) -> Playlist:
+    return Playlist(
+        id=str(p.id),
+        name=p.name,
+        description=getattr(p, "description", "") or "",
+        track_count=getattr(p, "num_tracks", 0) or 0,
+        creator=getattr(getattr(p, "creator", None), "name", None),
+        creator_id=_creator_id(p),
+        url=f"https://tidal.com/browse/playlist/{p.id}",
+    )
+
+
+def _song_key(t) -> Tuple[str, str]:
+    """Identity of a song across releases: TIDAL gives each release its own track ID."""
+    return (t.name or "").strip().casefold(), _primary_artist(t).strip().casefold()
+
+
+def _audio_quality(item) -> AudioQuality:
+    tags = [str(tag) for tag in (getattr(item, "media_metadata_tags", None) or [])]
+    modes = [str(mode) for mode in (getattr(item, "audio_modes", None) or [])]
+    base = str(getattr(item, "audio_quality", "") or "") or None
+
+    hi_res = "HIRES_LOSSLESS" in tags or base in ("HI_RES", "HI_RES_LOSSLESS")
+    lossless = hi_res or "LOSSLESS" in tags or base == "LOSSLESS"
+    dolby_atmos = "DOLBY_ATMOS" in tags or "DOLBY_ATMOS" in modes
+
+    if hi_res:
+        max_quality, summary = "HI_RES_LOSSLESS", "Hi-Res FLAC (24-bit, up to 192 kHz)"
+    elif lossless:
+        max_quality, summary = "LOSSLESS", "CD-quality FLAC (16-bit, 44.1 kHz)"
+    else:
+        max_quality, summary = base, "Lossy AAC (up to 320 kbps)"
+    if dolby_atmos:
+        summary += ", Dolby Atmos available"
+
+    return AudioQuality(
+        max_quality=max_quality,
+        media_tags=tags,
+        audio_modes=modes,
+        lossless=lossless,
+        hi_res=hi_res,
+        dolby_atmos=dolby_atmos,
+        summary=summary,
+    )
+
+
+def _normalize_isrc(isrc: str) -> str:
+    code = isrc.strip().upper().replace("-", "")
+    if not ISRC_PATTERN.match(code):
+        raise ToolError(f"Invalid ISRC format: '{isrc}' (expected e.g. USQX91300108)")
+    return code
+
+
+def _lookup_isrc(code: str) -> list:
+    """All TIDAL tracks for an ISRC, best candidate first (streamable, then most popular)."""
+    # The v1 endpoint returns every release in one call; tidalapi's openapi lookup
+    # needs one extra request per match and fails intermittently.
+    tracks = session.request.map_request(
+        "tracks", params={"isrc": code}, parse=session.parse_track
+    )
+    return sorted(tracks, key=lambda t: (not t.available, -(t.popularity or 0), t.id))
+
+
+def _require_user_playlist(playlist, playlist_id: str):
+    if not playlist:
+        raise ToolError(f"Playlist with ID '{playlist_id}' not found")
+    if not isinstance(playlist, tidalapi.UserPlaylist):
+        raise ToolError(f"Playlist '{playlist.name}' is not one of your playlists and cannot be edited")
+    return playlist
+
+
+def _fetch_playlist_items(playlist) -> Tuple[list, bool]:
+    """Every item (tracks and videos, in playlist order) up to MAX_PLAYLIST_ITEMS."""
+    total = (getattr(playlist, "num_tracks", 0) or 0) + (getattr(playlist, "num_videos", 0) or 0)
+    wanted = min(total, MAX_PLAYLIST_ITEMS)
+    items: list = []
+    while len(items) < wanted:
+        batch = playlist.items(limit=100, offset=len(items))
+        if not batch:
+            break
+        items.extend(batch)
+    return items[:MAX_PLAYLIST_ITEMS], total > MAX_PLAYLIST_ITEMS
+
+
+def _validate_user_id(user_id: str) -> str:
+    user_id = user_id.strip()
+    if not user_id.isdigit():
+        raise ToolError(f"Invalid user ID: '{user_id}' (expected digits only)")
+    return user_id
+
+
+def _fetch_profile(user_id: str) -> dict:
+    return session.request.request(
+        "GET", f"profiles/{user_id}", base_url=session.config.api_v2_location
+    ).json()
+
+
+def _picture_url(picture_id: str, size: int) -> str:
+    return session.config.image_url % (picture_id.replace("-", "/"), size, size)
+
+
+def _normalize_page(page: str) -> str:
+    key = page.strip()
+    if key.lower() == "home":
+        return "home"
+    path = PAGE_PATHS.get(key.lower(), key).lstrip("/")
+    # Home advertises its "view all" links under home/pages/..., which the API only serves at pages/...
+    if path.startswith("home/pages/"):
+        path = path[len("home/"):]
+    if not path.startswith("pages/") or ".." in path:
+        shortcuts = ", ".join(["home", *PAGE_PATHS])
+        raise ToolError(
+            f"Unknown page '{page}'. Use one of: {shortcuts}, or a path starting with "
+            f"'pages/' returned by browse_page"
+        )
+    return path
+
+
+def _load_page_sections(path: str) -> Tuple[str, list]:
+    """Load an editorial page and parse its sections, skipping section types tidalapi cannot parse."""
+    if path == "home":
+        json_obj = session.request.request(
+            "GET",
+            "home/feed/static",
+            base_url=session.config.api_v2_location,
+            params={"deviceType": "BROWSER", "locale": session.locale, "platform": "WEB"},
+        ).json()
+    else:
+        json_obj = session.request.request("GET", path, params={"deviceType": "BROWSER"}).json()
+
+    if "rows" in json_obj:
+        parse = tidalapi.page.PageCategory(session).parse
+        modules = [row["modules"][0] for row in json_obj.get("rows") or [] if row.get("modules")]
+    else:
+        parse = tidalapi.page.PageCategoryV2(session).parse_item
+        modules = json_obj.get("items") or []
+
+    sections = []
+    for module in modules:
+        try:
+            sections.append(parse(module))
+        except (NotImplementedError, KeyError, TypeError) as e:
+            get_logger().info(f"Skipping unsupported section on {path}: {e}")
+
+    title = json_obj.get("title") or ("Home" if path == "home" else path)
+    return title, sections
+
+
+def _section_items(section) -> list:
+    items = getattr(section, "items", None)
+    # Header sections (e.g. a mix header) are the item themselves.
+    return items if isinstance(items, list) else [section]
+
+
+def _section_more_path(section) -> Optional[str]:
+    api_path = getattr(getattr(section, "_more", None), "api_path", None)
+    if api_path and api_path.startswith("home/pages/"):
+        api_path = api_path[len("home/"):]
+    return api_path
+
+
+def _page_entry(item) -> Optional[PageEntry]:
+    if item is None or isinstance(item, tidalapi.Video):
+        return None
+    if isinstance(item, tidalapi.Track):
+        return PageEntry(
+            type="track", id=str(item.id), title=item.name, subtitle=_primary_artist(item),
+            url=f"https://tidal.com/browse/track/{item.id}",
+        )
+    if isinstance(item, tidalapi.Album):
+        return PageEntry(
+            type="album", id=str(item.id), title=item.name, subtitle=_primary_artist(item),
+            url=f"https://tidal.com/browse/album/{item.id}",
+        )
+    if isinstance(item, tidalapi.Artist):
+        return PageEntry(
+            type="artist", id=str(item.id), title=item.name,
+            url=f"https://tidal.com/browse/artist/{item.id}",
+        )
+    if isinstance(item, tidalapi.Playlist):
+        return PageEntry(
+            type="playlist", id=str(item.id), title=item.name,
+            subtitle=getattr(getattr(item, "creator", None), "name", None),
+            url=f"https://tidal.com/browse/playlist/{item.id}",
+        )
+    if isinstance(item, (tidalapi.Mix, tidalapi.MixV2)):
+        return PageEntry(
+            type="mix", id=str(item.id), title=item.title or "", subtitle=item.sub_title or None
+        )
+    if isinstance(item, tidalapi.page.PageLink):
+        return PageEntry(type="link", title=item.title, path=item.api_path)
+    if isinstance(item, tidalapi.page.PageItem):
+        kind = (item.type or "").upper()
+        # header is the banner label ("TIDAL EXCLUSIVE"...), the short headers name the item.
+        title = " - ".join(x for x in (item.short_header, item.short_sub_header) if x) or item.header or ""
+        subtitle = item.header or None
+        if kind in ("ALBUM", "TRACK", "ARTIST", "PLAYLIST"):
+            return PageEntry(
+                type=kind.lower(), id=str(item.artifact_id), title=title, subtitle=subtitle,
+                url=f"https://tidal.com/browse/{kind.lower()}/{item.artifact_id}",
+            )
+        if kind == "CATEGORY_PAGES":
+            return PageEntry(type="link", title=title, subtitle=subtitle, path=str(item.artifact_id))
+        if kind == "EXTURL":
+            return PageEntry(type="external", title=title, subtitle=subtitle, url=str(item.artifact_id))
+        return None
+    if isinstance(item, str):
+        return PageEntry(type="text", title=item)
+    if isinstance(item, dict):
+        title = item.get("title") or item.get("name") or ""
+        url = item.get("url") or item.get("link")
+        return PageEntry(type="external", title=str(title), url=url) if title or url else None
+    return None
+
+
+def _page_entries(section) -> List[PageEntry]:
+    return [entry for entry in map(_page_entry, _section_items(section)) if entry]
 
 
 # =============================================================================
@@ -422,6 +764,7 @@ async def search_playlists(query: str, limit: int = 10) -> PlaylistList:
                     description=getattr(playlist, "description", "") or "",
                     track_count=getattr(playlist, "num_tracks", 0),
                     creator=creator_name,
+                    creator_id=_creator_id(playlist),
                     url=f"https://tidal.com/browse/playlist/{playlist.id}",
                 )
             )
@@ -1697,6 +2040,7 @@ async def get_genre_playlists(genre_path: str, limit: int = 20) -> PlaylistList:
                     description=getattr(p, "description", "") or "",
                     track_count=getattr(p, "num_tracks", 0),
                     creator=creator_name,
+                    creator_id=_creator_id(p),
                     url=f"https://tidal.com/browse/playlist/{p.id}",
                 )
             )
@@ -1868,6 +2212,7 @@ async def get_favorite_playlists(limit: int = 50) -> PlaylistList:
                     description=getattr(p, "description", "") or "",
                     track_count=getattr(p, "num_tracks", 0),
                     creator=creator_name,
+                    creator_id=_creator_id(p),
                     url=f"https://tidal.com/browse/playlist/{p.id}",
                 )
             )
@@ -2325,6 +2670,1033 @@ async def move_playlist_to_folder(playlist_id: str, folder_id: str) -> MovedToFo
         )
     except Exception as e:
         raise ToolError(f"Failed to move playlist to folder: {str(e)}")
+
+
+# =============================================================================
+# Catalog Details
+# =============================================================================
+
+@mcp.tool(annotations=READ_ONLY)
+async def get_track(track_id: str) -> TrackDetails:
+    """
+    Get detailed information about a track, including ISRC and audio quality.
+
+    Args:
+        track_id: ID of the track
+
+    Returns:
+        Track details: version, ISRC, explicit flag, popularity, position on album,
+        release date, copyright, availability and audio quality tiers
+    """
+    if not await ensure_authenticated():
+        raise ToolError("Not authenticated. Please run the 'login' tool first.")
+
+    try:
+        track = await anyio.to_thread.run_sync(session.track, track_id)
+        if not track:
+            raise ToolError(f"Track with ID '{track_id}' not found")
+
+        release = getattr(track.album, "release_date", None) if track.album else None
+        return TrackDetails(
+            status="success",
+            track=_track_model(track),
+            version=track.version or None,
+            isrc=getattr(track, "isrc", None),
+            explicit=bool(track.explicit),
+            popularity=track.popularity,
+            track_number=track.track_num,
+            volume_number=track.volume_num,
+            release_date=_date_str(release or track.tidal_release_date),
+            copyright=getattr(track, "copyright", None),
+            available=bool(track.available),
+            quality=_audio_quality(track),
+        )
+    except ToolError:
+        raise
+    except Exception as e:
+        raise ToolError(f"Failed to get track: {str(e)}")
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def get_audio_quality(item_type: Literal["track", "album"], item_id: str) -> AudioQualityResult:
+    """
+    Get the best audio quality TIDAL offers for a track or an album.
+
+    Useful to pick the best version among several releases of the same music.
+    TIDAL exposes quality tiers, not the exact sample rate: Hi-Res means 24-bit FLAC
+    up to 192 kHz, Lossless means 16-bit / 44.1 kHz FLAC.
+
+    Args:
+        item_type: 'track' or 'album'
+        item_id: ID of the track or album
+
+    Returns:
+        Quality tiers: lossless, Hi-Res, Dolby Atmos, plus a readable summary
+    """
+    if not await ensure_authenticated():
+        raise ToolError("Not authenticated. Please run the 'login' tool first.")
+
+    try:
+        loader = session.track if item_type == "track" else session.album
+        item = await anyio.to_thread.run_sync(loader, item_id)
+        if not item:
+            raise ToolError(f"{item_type.capitalize()} with ID '{item_id}' not found")
+
+        return AudioQualityResult(
+            status="success",
+            item_type=item_type,
+            item_id=item_id,
+            title=item.name,
+            artist=_primary_artist(item),
+            quality=_audio_quality(item),
+        )
+    except ToolError:
+        raise
+    except Exception as e:
+        raise ToolError(f"Failed to get audio quality: {str(e)}")
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def get_tracks_by_isrc(isrc: str) -> TrackList:
+    """
+    Find every TIDAL track for an ISRC (the unique code of a recording).
+
+    One recording often appears on several releases (original album, compilations,
+    reissues), each with its own track ID.
+
+    Args:
+        isrc: ISRC code, e.g. 'USQX91300108' (dashes allowed)
+
+    Returns:
+        Matching tracks, streamable and most popular first (usually the original release)
+    """
+    if not await ensure_authenticated():
+        raise ToolError("Not authenticated. Please run the 'login' tool first.")
+
+    code = _normalize_isrc(isrc)
+    try:
+        matches = await anyio.to_thread.run_sync(_lookup_isrc, code)
+        tracks = [_track_model(t) for t in matches]
+        return TrackList(status="success", query=code, count=len(tracks), tracks=tracks)
+    except Exception as e:
+        raise ToolError(f"ISRC lookup failed: {str(e)}")
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def get_albums_by_barcode(barcode: str) -> AlbumList:
+    """
+    Find albums on TIDAL from the barcode (UPC/EAN) printed on a CD or record.
+
+    Args:
+        barcode: 8 to 14 digit barcode, e.g. '886443927087'
+
+    Returns:
+        Matching albums (empty list if TIDAL does not have this release)
+    """
+    if not await ensure_authenticated():
+        raise ToolError("Not authenticated. Please run the 'login' tool first.")
+
+    code = barcode.strip().replace(" ", "").replace("-", "")
+    if not code.isdigit() or not 8 <= len(code) <= 14:
+        raise ToolError(f"Invalid barcode: '{barcode}' (expected 8 to 14 digits)")
+
+    try:
+        try:
+            matches = await anyio.to_thread.run_sync(session.get_albums_by_barcode, code)
+        except ObjectNotFound:
+            matches = []
+        albums = [_album_model(a) for a in matches]
+        return AlbumList(status="success", query=code, count=len(albums), albums=albums)
+    except Exception as e:
+        raise ToolError(f"Barcode lookup failed: {str(e)}")
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def get_album_review(album_id: str) -> AlbumReview:
+    """
+    Get TIDAL's editorial review of an album.
+
+    Args:
+        album_id: ID of the album
+
+    Returns:
+        Review text (raises an error if the album has no review)
+    """
+    if not await ensure_authenticated():
+        raise ToolError("Not authenticated. Please run the 'login' tool first.")
+
+    try:
+        album = await anyio.to_thread.run_sync(session.album, album_id)
+        if not album:
+            raise ToolError(f"Album with ID '{album_id}' not found")
+
+        try:
+            raw = await anyio.to_thread.run_sync(album.review)
+        except Exception:
+            raise ToolError(f"No review available for album '{album.name}'")
+
+        return AlbumReview(
+            status="success",
+            album_id=album_id,
+            album_title=album.name,
+            artist=_primary_artist(album),
+            text=WIMP_LINK_PATTERN.sub(r"\1", raw).strip(),
+        )
+    except ToolError:
+        raise
+    except Exception as e:
+        raise ToolError(f"Failed to get album review: {str(e)}")
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def get_artist_ep_singles(artist_id: str, limit: int = 20) -> AlbumList:
+    """
+    Get an artist's EPs and singles (not included in get_artist_albums).
+
+    Args:
+        artist_id: ID of the artist
+        limit: Maximum releases to return (default: 20, max: 100)
+
+    Returns:
+        List of EPs and singles
+    """
+    if not await ensure_authenticated():
+        raise ToolError("Not authenticated. Please run the 'login' tool first.")
+
+    try:
+        limit = min(max(1, limit), 100)
+        artist = await anyio.to_thread.run_sync(session.artist, artist_id)
+        if not artist:
+            raise ToolError(f"Artist with ID '{artist_id}' not found")
+
+        releases = await anyio.to_thread.run_sync(lambda: artist.get_ep_singles(limit=limit))
+        albums = [_album_model(a) for a in releases]
+        return AlbumList(status="success", count=len(albums), albums=albums)
+    except ToolError:
+        raise
+    except Exception as e:
+        raise ToolError(f"Failed to get EPs and singles: {str(e)}")
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def get_artist_appearances(artist_id: str, limit: int = 20) -> AlbumList:
+    """
+    Get compilations and other artists' albums on which an artist appears.
+
+    Args:
+        artist_id: ID of the artist
+        limit: Maximum albums to return (default: 20, max: 100)
+
+    Returns:
+        List of albums featuring the artist
+    """
+    if not await ensure_authenticated():
+        raise ToolError("Not authenticated. Please run the 'login' tool first.")
+
+    try:
+        limit = min(max(1, limit), 100)
+        artist = await anyio.to_thread.run_sync(session.artist, artist_id)
+        if not artist:
+            raise ToolError(f"Artist with ID '{artist_id}' not found")
+
+        releases = await anyio.to_thread.run_sync(lambda: artist.get_other(limit=limit))
+        albums = [_album_model(a) for a in releases]
+        return AlbumList(status="success", count=len(albums), albums=albums)
+    except ToolError:
+        raise
+    except Exception as e:
+        raise ToolError(f"Failed to get artist appearances: {str(e)}")
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def get_image_urls(
+    item_type: Literal["album", "artist", "playlist", "mix", "user"], item_id: str
+) -> ImageUrls:
+    """
+    Get image URLs (cover, artist photo, playlist or mix artwork, profile picture).
+
+    Args:
+        item_type: 'album', 'artist', 'playlist', 'mix' or 'user'
+        item_id: ID of the item
+
+    Returns:
+        Image URL for every size TIDAL serves, keyed by size (e.g. '1280x1280')
+    """
+    if not await ensure_authenticated():
+        raise ToolError("Not authenticated. Please run the 'login' tool first.")
+
+    if item_type == "user":
+        item_id = _validate_user_id(item_id)
+
+    def collect() -> Tuple[str, Dict[str, str]]:
+        sizes = IMAGE_SIZES[item_type]
+        if item_type == "user":
+            profile = _fetch_profile(item_id)
+            picture = profile.get("picture")
+            urls = {f"{s}x{s}": _picture_url(picture, s) for s in sizes} if picture else {}
+            return profile.get("name") or item_id, urls
+
+        loaders = {
+            "album": session.album,
+            "artist": session.artist,
+            "playlist": session.playlist,
+            "mix": session.mix,
+        }
+        item = loaders[item_type](item_id)
+        urls = {}
+        for s in sizes:
+            try:
+                urls[f"{s}x{s}"] = item.image(s)
+            except (ValueError, AttributeError, TypeError):
+                break  # no image for this item
+        if item_type == "playlist":
+            for width, height in PLAYLIST_WIDE_SIZES:
+                try:
+                    urls[f"{width}x{height}"] = item.wide_image(width, height)
+                except (ValueError, AttributeError, TypeError):
+                    break
+        return getattr(item, "name", None) or getattr(item, "title", None) or item_id, urls
+
+    try:
+        name, urls = await anyio.to_thread.run_sync(collect)
+        if not urls:
+            raise ToolError(f"No image available for {item_type} '{name}'")
+        return ImageUrls(status="success", item_type=item_type, item_id=item_id, name=name, urls=urls)
+    except ToolError:
+        raise
+    except Exception as e:
+        raise ToolError(f"Failed to get images: {str(e)}")
+
+
+# =============================================================================
+# Other Users
+# =============================================================================
+
+@mcp.tool(annotations=READ_ONLY)
+async def get_user_profile(user_id: str) -> UserProfile:
+    """
+    Get the public profile of a TIDAL user.
+
+    Args:
+        user_id: TIDAL user ID (the 'creator_id' field of a playlist)
+
+    Returns:
+        Display name, handle, follower counts and profile picture
+    """
+    if not await ensure_authenticated():
+        raise ToolError("Not authenticated. Please run the 'login' tool first.")
+
+    user_id = _validate_user_id(user_id)
+    try:
+        profile = await anyio.to_thread.run_sync(_fetch_profile, user_id)
+        picture = profile.get("picture")
+        return UserProfile(
+            status="success",
+            id=str(profile.get("userId") or user_id),
+            name=profile.get("name") or "",
+            handle=profile.get("handle"),
+            followers=profile.get("numberOfFollowers") or 0,
+            follows=profile.get("numberOfFollows") or 0,
+            profile_type=profile.get("profileType"),
+            picture_url=_picture_url(picture, 600) if picture else None,
+        )
+    except Exception as e:
+        raise ToolError(f"Failed to get user profile: {str(e)}")
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def get_user_public_playlists(user_id: str, limit: int = 50) -> PlaylistList:
+    """
+    Get the public playlists of a TIDAL user (works with your own user ID too).
+
+    Args:
+        user_id: TIDAL user ID (the 'creator_id' field of a playlist)
+        limit: Maximum playlists to return (default: 50, max: 50)
+
+    Returns:
+        List of the user's public playlists
+    """
+    if not await ensure_authenticated():
+        raise ToolError("Not authenticated. Please run the 'login' tool first.")
+
+    user_id = _validate_user_id(user_id)
+    limit = min(max(1, limit), 50)
+
+    def fetch() -> list:
+        json_obj = session.request.request(
+            "GET",
+            f"user-playlists/{user_id}/public",
+            base_url=session.config.api_v2_location,
+            params={"limit": limit, "offset": 0},
+        ).json()
+        items = [item["playlist"] for item in json_obj.get("items", []) if item.get("playlist")]
+        return session.request.map_json({"items": items}, parse=session.playlist().parse_factory)
+
+    try:
+        raw = await anyio.to_thread.run_sync(fetch)
+        playlists = [_playlist_model(p) for p in raw]
+        return PlaylistList(status="success", count=len(playlists), playlists=playlists)
+    except Exception as e:
+        raise ToolError(f"Failed to get public playlists: {str(e)}")
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def get_favorite_counts() -> FavoriteCounts:
+    """
+    Count the items in each of your favorites collections.
+
+    Returns:
+        Number of favorite tracks, albums, artists and playlists
+    """
+    if not await ensure_authenticated():
+        raise ToolError("Not authenticated. Please run the 'login' tool first.")
+
+    try:
+        favorites = session.user.favorites
+        tracks = await anyio.to_thread.run_sync(favorites.get_tracks_count)
+        albums = await anyio.to_thread.run_sync(favorites.get_albums_count)
+        artists = await anyio.to_thread.run_sync(favorites.get_artists_count)
+        playlists = await anyio.to_thread.run_sync(favorites.get_playlists_count)
+        return FavoriteCounts(
+            status="success", tracks=tracks, albums=albums, artists=artists, playlists=playlists
+        )
+    except Exception as e:
+        raise ToolError(f"Failed to count favorites: {str(e)}")
+
+
+# =============================================================================
+# Editorial Pages (Home, Explore, For You, genres, moods...)
+# =============================================================================
+
+@mcp.tool(annotations=READ_ONLY)
+async def browse_page(page: str = "home", items_per_section: int = 5) -> PageView:
+    """
+    Browse a TIDAL editorial page, section by section, as in the TIDAL app.
+
+    Pages: 'home' (personalized feed), 'explore', 'for_you', 'hires', 'genres',
+    'local_genres', 'moods', 'mixes', or any page path returned by this tool
+    (an item's 'path' for links, or a section's 'more_path' for its full list).
+
+    Args:
+        page: Page name or path (default: 'home')
+        items_per_section: Items previewed per section (default: 5, max: 20, 0 for titles only)
+
+    Returns:
+        Page sections with their index, title, a preview of their items and more_path.
+        Use get_page_section to list all items of one section.
+    """
+    if not await ensure_authenticated():
+        raise ToolError("Not authenticated. Please run the 'login' tool first.")
+
+    path = _normalize_page(page)
+    items_per_section = min(max(0, items_per_section), 20)
+    try:
+        title, raw_sections = await anyio.to_thread.run_sync(_load_page_sections, path)
+
+        sections = []
+        for index, raw in enumerate(raw_sections):
+            entries = _page_entries(raw)
+            if not entries:
+                continue  # e.g. video-only sections
+            sections.append(
+                PageSection(
+                    index=index,
+                    title=getattr(raw, "title", None) or "",
+                    item_count=len(entries),
+                    more_path=_section_more_path(raw),
+                    items=entries[:items_per_section],
+                )
+            )
+
+        return PageView(status="success", page=path, title=title, count=len(sections), sections=sections)
+    except Exception as e:
+        raise ToolError(f"Failed to browse page: {str(e)}")
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def get_page_section(
+    page: str, section_index: int, limit: int = 50, offset: int = 0
+) -> PageSectionItems:
+    """
+    List the items of one section of an editorial page.
+
+    A section only holds what the page displays (often 10 to 15 items). When the
+    section has a more_path, pass it to browse_page to get the complete list.
+
+    Args:
+        page: Page name or path, as given to browse_page
+        section_index: Section index from browse_page
+        limit: Maximum items to return (default: 50, max: 100)
+        offset: Index of the first item to return (default: 0)
+
+    Returns:
+        Section items (tracks, albums, artists, playlists, mixes or links to other pages)
+    """
+    if not await ensure_authenticated():
+        raise ToolError("Not authenticated. Please run the 'login' tool first.")
+
+    path = _normalize_page(page)
+    limit = min(max(1, limit), 100)
+    offset = max(0, offset)
+    try:
+        _, raw_sections = await anyio.to_thread.run_sync(_load_page_sections, path)
+        if not 0 <= section_index < len(raw_sections):
+            raise ToolError(
+                f"Page '{path}' has no section {section_index} (it has {len(raw_sections)})"
+            )
+
+        raw = raw_sections[section_index]
+        entries = _page_entries(raw)
+        selected = entries[offset:offset + limit]
+        return PageSectionItems(
+            status="success",
+            page=path,
+            section_index=section_index,
+            title=getattr(raw, "title", None) or "",
+            more_path=_section_more_path(raw),
+            total=len(entries),
+            offset=offset,
+            count=len(selected),
+            items=selected,
+        )
+    except ToolError:
+        raise
+    except Exception as e:
+        raise ToolError(f"Failed to get page section: {str(e)}")
+
+
+# =============================================================================
+# Multi-seed Recommendations
+# =============================================================================
+
+@mcp.tool(annotations=READ_ONLY)
+async def recommend_tracks(
+    seed_track_ids: List[str],
+    limit: int = 30,
+    exclude_playlist_id: Optional[str] = None,
+    max_per_artist: int = 2,
+) -> TrackRecommendations:
+    """
+    Recommend tracks from several seed tracks by combining their TIDAL radios.
+
+    Tracks suggested by several seeds rank first, then the seeds' radios are
+    interleaved. Seeds, duplicates (same title and artist) and tracks already in
+    exclude_playlist_id are skipped.
+
+    Args:
+        seed_track_ids: 1 to 10 track IDs describing the wanted style
+        limit: Maximum tracks to return (default: 30, max: 100)
+        exclude_playlist_id: Playlist whose tracks must not be recommended (optional),
+            typically the playlist being extended
+        max_per_artist: Maximum tracks per artist (default: 2, 0 for no limit)
+
+    Returns:
+        Recommended tracks, each with the seed IDs that suggested it
+    """
+    if not await ensure_authenticated():
+        raise ToolError("Not authenticated. Please run the 'login' tool first.")
+
+    seeds = list(dict.fromkeys(s.strip() for s in seed_track_ids if s.strip()))
+    if not 1 <= len(seeds) <= 10:
+        raise ToolError("Provide between 1 and 10 seed track IDs")
+    limit = min(max(1, limit), 100)
+    max_per_artist = max(0, max_per_artist)
+
+    def compute():
+        excluded_ids = set(seeds)
+        excluded_keys = set()
+        seed_tracks = {}
+        for seed_id in seeds:
+            track = session.track(seed_id)
+            seed_tracks[seed_id] = track
+            excluded_keys.add(_song_key(track))
+
+        if exclude_playlist_id:
+            playlist = session.playlist(exclude_playlist_id)
+            items, _ = _fetch_playlist_items(playlist)
+            for item in items:
+                excluded_ids.add(str(item.id))
+                if isinstance(item, tidalapi.Track):
+                    excluded_keys.add(_song_key(item))
+
+        candidates: Dict[Tuple[str, str], dict] = {}
+        skipped = set()
+        without_radio = []
+        for seed_id in seeds:
+            try:
+                radio = seed_tracks[seed_id].get_track_radio(limit=100)
+            except Exception:
+                without_radio.append(seed_id)
+                continue
+            for rank, track in enumerate(radio):
+                key = _song_key(track)
+                if str(track.id) in excluded_ids or key in excluded_keys:
+                    skipped.add(key)
+                    continue
+                candidate = candidates.setdefault(key, {"track": track, "seeds": [], "rank": rank})
+                if seed_id not in candidate["seeds"]:
+                    candidate["seeds"].append(seed_id)
+                candidate["rank"] = min(candidate["rank"], rank)
+
+        ordered = sorted(candidates.values(), key=lambda c: (-len(c["seeds"]), c["rank"]))
+        per_artist: Counter = Counter()
+        selected = []
+        for candidate in ordered:
+            artist = _primary_artist(candidate["track"]).casefold()
+            if max_per_artist and per_artist[artist] >= max_per_artist:
+                continue
+            per_artist[artist] += 1
+            selected.append(candidate)
+            if len(selected) >= limit:
+                break
+        return selected, len(skipped), without_radio
+
+    try:
+        selected, excluded_count, without_radio = await anyio.to_thread.run_sync(compute)
+        tracks = [
+            RecommendedTrack(**_track_model(c["track"]).model_dump(), seed_ids=c["seeds"])
+            for c in selected
+        ]
+        return TrackRecommendations(
+            status="success",
+            seed_ids=seeds,
+            seeds_without_radio=without_radio,
+            excluded_count=excluded_count,
+            count=len(tracks),
+            tracks=tracks,
+        )
+    except Exception as e:
+        raise ToolError(f"Failed to recommend tracks: {str(e)}")
+
+
+# =============================================================================
+# Playlist Analysis
+# =============================================================================
+
+@mcp.tool(annotations=READ_ONLY)
+async def analyze_playlist(playlist_id: str, top_artists: int = 10) -> PlaylistAnalysis:
+    """
+    Analyze a playlist: duration, dominant artists, decades, duplicates, sequencing.
+
+    Duplicates are songs with the same title and artist, whatever the release or
+    version; each occurrence gives its position, usable with remove_tracks_from_playlist.
+
+    Args:
+        playlist_id: ID of the playlist
+        top_artists: Number of most represented artists to list (default: 10, max: 50)
+
+    Returns:
+        Playlist statistics and the list of duplicated songs
+    """
+    if not await ensure_authenticated():
+        raise ToolError("Not authenticated. Please run the 'login' tool first.")
+
+    top_artists = min(max(1, top_artists), 50)
+    try:
+        playlist = await anyio.to_thread.run_sync(session.playlist, playlist_id)
+        if not playlist:
+            raise ToolError(f"Playlist with ID '{playlist_id}' not found")
+
+        items, truncated = await anyio.to_thread.run_sync(_fetch_playlist_items, playlist)
+        tracks = [(pos, t) for pos, t in enumerate(items) if isinstance(t, tidalapi.Track)]
+
+        artist_counts: Counter = Counter()
+        decades: Counter = Counter()
+        groups: Dict[Tuple[str, str], List[Tuple[int, object]]] = {}
+        duration = explicit = unavailable = without_date = same_artist = 0
+        previous_artist = None
+        for pos, t in tracks:
+            artist = _primary_artist(t)
+            artist_counts[artist] += 1
+            duration += t.duration or 0
+            explicit += 1 if t.explicit else 0
+            unavailable += 0 if t.available else 1
+            release = getattr(t.album, "release_date", None) if t.album else None
+            release = release or t.tidal_release_date
+            if release:
+                decades[f"{release.year // 10 * 10}s"] += 1
+            else:
+                without_date += 1
+            if artist == previous_artist:
+                same_artist += 1
+            previous_artist = artist
+            groups.setdefault(_song_key(t), []).append((pos, t))
+
+        duplicates = [
+            DuplicateGroup(
+                title=occurrences[0][1].name,
+                artist=_primary_artist(occurrences[0][1]),
+                occurrences=[
+                    DuplicateOccurrence(
+                        position=pos,
+                        track_id=str(t.id),
+                        album=t.album.name if t.album else "Unknown Album",
+                        version=t.version or None,
+                    )
+                    for pos, t in occurrences
+                ],
+            )
+            for occurrences in groups.values()
+            if len(occurrences) > 1
+        ]
+        duplicates.sort(key=lambda d: (-len(d.occurrences), d.occurrences[0].position))
+
+        n = len(tracks)
+        return PlaylistAnalysis(
+            status="success",
+            playlist_id=playlist_id,
+            playlist_name=playlist.name,
+            track_count=n,
+            truncated=truncated,
+            total_duration_seconds=duration,
+            average_duration_seconds=duration // n if n else 0,
+            distinct_artists=len(artist_counts),
+            top_artists=[
+                ArtistShare(artist=name, track_count=count, percent=round(100 * count / n, 1))
+                for name, count in artist_counts.most_common(top_artists)
+            ],
+            decades=dict(sorted(decades.items())),
+            tracks_without_date=without_date,
+            explicit_tracks=explicit,
+            unavailable_tracks=unavailable,
+            consecutive_same_artist=same_artist,
+            duplicate_count=len(duplicates),
+            duplicates=duplicates,
+        )
+    except ToolError:
+        raise
+    except Exception as e:
+        raise ToolError(f"Failed to analyze playlist: {str(e)}")
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def compare_playlists(
+    playlist_id_a: str, playlist_id_b: str, max_listed: int = 100
+) -> PlaylistComparison:
+    """
+    Compare two playlists: songs in both, songs only in A, songs only in B.
+
+    Songs are matched on title and artist, so two releases of the same song count
+    as the same song.
+
+    Args:
+        playlist_id_a: ID of playlist A
+        playlist_id_b: ID of playlist B
+        max_listed: Maximum songs listed per category (default: 100, max: 500).
+            Counts always cover every song.
+
+    Returns:
+        Counts and lists of shared and unique songs
+    """
+    if not await ensure_authenticated():
+        raise ToolError("Not authenticated. Please run the 'login' tool first.")
+
+    max_listed = min(max(1, max_listed), 500)
+
+    def load(pid: str):
+        playlist = session.playlist(pid)
+        if not playlist:
+            raise ToolError(f"Playlist with ID '{pid}' not found")
+        items, _ = _fetch_playlist_items(playlist)
+        index: Dict[Tuple[str, str], object] = {}
+        for item in items:
+            if isinstance(item, tidalapi.Track):
+                index.setdefault(_song_key(item), item)
+        return playlist, len(items), index
+
+    try:
+        playlist_a, count_a, index_a = await anyio.to_thread.run_sync(load, playlist_id_a)
+        playlist_b, count_b, index_b = await anyio.to_thread.run_sync(load, playlist_id_b)
+
+        def entry(key) -> ComparedTrack:
+            t = index_a.get(key) or index_b[key]
+            return ComparedTrack(
+                title=t.name,
+                artist=_primary_artist(t),
+                track_id_a=str(index_a[key].id) if key in index_a else None,
+                track_id_b=str(index_b[key].id) if key in index_b else None,
+            )
+
+        common = [k for k in index_a if k in index_b]
+        only_a = [k for k in index_a if k not in index_b]
+        only_b = [k for k in index_b if k not in index_a]
+
+        return PlaylistComparison(
+            status="success",
+            playlist_a_id=playlist_id_a,
+            playlist_a_name=playlist_a.name,
+            playlist_b_id=playlist_id_b,
+            playlist_b_name=playlist_b.name,
+            track_count_a=count_a,
+            track_count_b=count_b,
+            common_count=len(common),
+            only_in_a_count=len(only_a),
+            only_in_b_count=len(only_b),
+            lists_truncated=max(len(common), len(only_a), len(only_b)) > max_listed,
+            common=[entry(k) for k in common[:max_listed]],
+            only_in_a=[entry(k) for k in only_a[:max_listed]],
+            only_in_b=[entry(k) for k in only_b[:max_listed]],
+        )
+    except ToolError:
+        raise
+    except Exception as e:
+        raise ToolError(f"Failed to compare playlists: {str(e)}")
+
+
+# =============================================================================
+# Playlist Editing (extended)
+# =============================================================================
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True})
+async def clear_playlist(playlist_id: str) -> ClearPlaylistResult:
+    """
+    Remove every track from one of your playlists (the playlist itself is kept).
+
+    Args:
+        playlist_id: ID of the playlist to empty
+
+    Returns:
+        Number of items removed
+    """
+    if not await ensure_authenticated():
+        raise ToolError("Not authenticated. Please run the 'login' tool first.")
+
+    try:
+        playlist = await anyio.to_thread.run_sync(session.playlist, playlist_id)
+        playlist = _require_user_playlist(playlist, playlist_id)
+
+        count = (playlist.num_tracks or 0) + (getattr(playlist, "num_videos", 0) or 0)
+        await anyio.to_thread.run_sync(playlist.clear)
+
+        return ClearPlaylistResult(
+            status="success",
+            playlist_id=playlist_id,
+            playlist_name=playlist.name,
+            tracks_removed=count,
+            message=f"Removed {count} items from playlist '{playlist.name}'",
+        )
+    except ToolError:
+        raise
+    except Exception as e:
+        raise ToolError(f"Failed to clear playlist: {str(e)}")
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False})
+async def merge_playlists(
+    playlist_id: str, source_playlist_id: str, allow_duplicates: bool = False
+) -> MergePlaylistsResult:
+    """
+    Append all tracks of a source playlist to one of your playlists.
+
+    The source playlist is left unchanged and can be anyone's playlist.
+
+    Args:
+        playlist_id: ID of your playlist receiving the tracks
+        source_playlist_id: ID of the playlist to copy tracks from
+        allow_duplicates: Add tracks already in the target (default: False)
+
+    Returns:
+        Number of tracks added
+    """
+    if not await ensure_authenticated():
+        raise ToolError("Not authenticated. Please run the 'login' tool first.")
+
+    try:
+        playlist = await anyio.to_thread.run_sync(session.playlist, playlist_id)
+        playlist = _require_user_playlist(playlist, playlist_id)
+        source = await anyio.to_thread.run_sync(session.playlist, source_playlist_id)
+        if not source:
+            raise ToolError(f"Playlist with ID '{source_playlist_id}' not found")
+
+        added = await anyio.to_thread.run_sync(
+            lambda: playlist.merge(source_playlist_id, allow_duplicates=allow_duplicates)
+        )
+
+        return MergePlaylistsResult(
+            status="success",
+            playlist_id=playlist_id,
+            playlist_name=playlist.name,
+            source_playlist_id=source_playlist_id,
+            source_playlist_name=source.name,
+            tracks_added=len(added),
+            message=f"Added {len(added)} tracks from '{source.name}' to '{playlist.name}'",
+        )
+    except ToolError:
+        raise
+    except Exception as e:
+        raise ToolError(f"Failed to merge playlists: {str(e)}")
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False})
+async def move_playlist_tracks(playlist_id: str, indices: List[int], position: int) -> MoveTracksResult:
+    """
+    Move one or more tracks to a new position inside one of your playlists.
+
+    Args:
+        playlist_id: ID of the playlist
+        indices: 0-based positions of the tracks to move (from get_playlist_tracks order)
+        position: 0-based position where the tracks go; -1 moves them to the end
+
+    Returns:
+        Number of tracks moved and the position used
+    """
+    if not await ensure_authenticated():
+        raise ToolError("Not authenticated. Please run the 'login' tool first.")
+
+    if not indices:
+        raise ToolError("Provide at least one index to move")
+
+    try:
+        playlist = await anyio.to_thread.run_sync(session.playlist, playlist_id)
+        playlist = _require_user_playlist(playlist, playlist_id)
+
+        size = (playlist.num_tracks or 0) + (getattr(playlist, "num_videos", 0) or 0)
+        invalid = [i for i in indices if not 0 <= i < size]
+        if invalid:
+            raise ToolError(f"Indices out of range for a playlist of {size} items: {invalid}")
+        if position >= size or position < 0:
+            position = size
+
+        await anyio.to_thread.run_sync(lambda: playlist.move_by_indices(sorted(set(indices)), position))
+
+        moved = len(set(indices))
+        return MoveTracksResult(
+            status="success",
+            playlist_id=playlist_id,
+            playlist_name=playlist.name,
+            tracks_moved=moved,
+            position=position,
+            message=f"Moved {moved} tracks to position {position} in '{playlist.name}'",
+        )
+    except ToolError:
+        raise
+    except Exception as e:
+        raise ToolError(f"Failed to move tracks: {str(e)}")
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True})
+async def set_playlist_visibility(playlist_id: str, public: bool) -> PlaylistVisibilityResult:
+    """
+    Make one of your playlists public (visible on your profile) or private.
+
+    Args:
+        playlist_id: ID of the playlist
+        public: True to make it public, False to make it private
+
+    Returns:
+        New visibility of the playlist
+    """
+    if not await ensure_authenticated():
+        raise ToolError("Not authenticated. Please run the 'login' tool first.")
+
+    try:
+        playlist = await anyio.to_thread.run_sync(session.playlist, playlist_id)
+        playlist = _require_user_playlist(playlist, playlist_id)
+
+        action = playlist.set_playlist_public if public else playlist.set_playlist_private
+        await anyio.to_thread.run_sync(action)
+
+        visibility = "public" if public else "private"
+        return PlaylistVisibilityResult(
+            status="success",
+            playlist_id=playlist_id,
+            playlist_name=playlist.name,
+            public=public,
+            message=f"Playlist '{playlist.name}' is now {visibility}",
+        )
+    except ToolError:
+        raise
+    except Exception as e:
+        raise ToolError(f"Failed to change playlist visibility: {str(e)}")
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False})
+async def add_tracks_to_playlist_by_isrc(
+    playlist_id: str, isrcs: List[str], allow_duplicates: bool = False
+) -> AddByIsrcResult:
+    """
+    Add tracks to one of your playlists from their ISRC codes.
+
+    For each ISRC, the streamable and most popular release is chosen (usually the
+    original album rather than a compilation).
+
+    Args:
+        playlist_id: ID of the playlist
+        isrcs: ISRC codes to add, in order
+        allow_duplicates: Add tracks already in the playlist (default: False)
+
+    Returns:
+        Tracks chosen, number actually added, and ISRCs not found on TIDAL
+    """
+    if not await ensure_authenticated():
+        raise ToolError("Not authenticated. Please run the 'login' tool first.")
+
+    if not isrcs:
+        raise ToolError("Provide at least one ISRC")
+    codes = [_normalize_isrc(code) for code in isrcs]
+
+    try:
+        playlist = await anyio.to_thread.run_sync(session.playlist, playlist_id)
+        playlist = _require_user_playlist(playlist, playlist_id)
+
+        resolved, not_found = [], []
+        for code in codes:
+            matches = await anyio.to_thread.run_sync(_lookup_isrc, code)
+            if matches:
+                resolved.append(matches[0])
+            else:
+                not_found.append(code)
+
+        added: list = []
+        if resolved:
+            added = await anyio.to_thread.run_sync(
+                lambda: playlist.add([str(t.id) for t in resolved], allow_duplicates=allow_duplicates)
+            )
+
+        return AddByIsrcResult(
+            status="success",
+            playlist_id=playlist_id,
+            playlist_name=playlist.name,
+            tracks_added=len(added),
+            resolved=[_track_model(t) for t in resolved],
+            not_found=not_found,
+            message=f"Added {len(added)} tracks to '{playlist.name}'"
+            + (f", {len(not_found)} ISRC not found" if not_found else ""),
+        )
+    except ToolError:
+        raise
+    except Exception as e:
+        raise ToolError(f"Failed to add tracks by ISRC: {str(e)}")
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True})
+async def move_playlist_to_root(playlist_id: str) -> MovedToFolderResult:
+    """
+    Take a playlist out of its folder and put it back at the root of your collection.
+
+    Args:
+        playlist_id: UUID of the playlist to move
+
+    Returns:
+        Confirmation of the move
+    """
+    if not await ensure_authenticated():
+        raise ToolError("Not authenticated. Please run the 'login' tool first.")
+
+    try:
+        await anyio.to_thread.run_sync(
+            lambda: session.folder().move_items_to_folder([playlist_id], folder="root")
+        )
+
+        return MovedToFolderResult(
+            status="success",
+            playlist_id=playlist_id,
+            folder_id="root",
+            folder_name="root",
+            message="Playlist moved to the root of your collection",
+        )
+    except Exception as e:
+        raise ToolError(f"Failed to move playlist to root: {str(e)}")
 
 
 # =============================================================================
